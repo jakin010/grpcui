@@ -203,10 +203,10 @@ When working with an RPC that has a streaming request, the JSON data will be a J
 each element is a single message in the stream.
 
 ### Responses
-When the "Invoke" button is pressed, the request data is sent to the server and the selected RPC
-method is invoked. The web form will then navigate to the third tab to show the server's response.
+When the "Invoke" button is pressed (or Cmd/Ctrl+Enter), the request data is sent to the server
+and the selected RPC method is invoked. The response appears in the panel next to the request.
 
-The response tab has three sections:
+The response panel has three tabs:
 
 1. Response Headers: Any response header metadata is shown here.
 2. Response Data: Any response messages are shown here as are any error messages. RPC methods with
@@ -221,6 +221,36 @@ The response tab has three sections:
 Each of these three sections is a table of data. Response messages are the most interesting, and
 their structure closely resembles how messages are structured on the "Request Form" tab. Fields that
 have nested messages will include a nested table.
+
+### History and Saved Requests
+Every call you make is added to the history (the clock button in the top bar), from which you can
+load it back into the form. You can also give a request a name and save it, with Saved › Save current
+request (or Cmd/Ctrl+S), and load it again later from the Saved menu. A saved request keeps the
+request body, the timeout and the headers set on that request (not inherited metadata).
+
+Saved requests are meant to be shared. Saved › Manage saved requests lets you export all of them,
+or only the ones you select, to a JSON file that other people can import. Headers are left out of
+the export unless you turn on "Include metadata", since they often hold credentials. The file uses
+the same format as the `-examples` flag, so it can also be passed to `grpcui -examples`. When
+importing, requests that are already saved are skipped, and a request whose name is already taken
+by a different request for the same method is renamed, to "name (2)", "name (3)" and so on.
+
+When the web UI is only reachable from your machine (the default `-bind` of 127.0.0.1, or another
+loopback address), history and saved requests are kept in a SQLite database in your user
+configuration folder (for example `~/.config/grpcui/grpcui.db` on Linux or
+`~/Library/Application Support/grpcui/grpcui.db` on macOS), so they are shared by every browser on
+the machine and survive clearing browser data. Use `-db path` to use another file, or `-db=""` to
+not use a database; the web UI then keeps them in the browser's local storage instead. The database
+can hold request metadata such as credentials, so it is created readable only by your user.
+
+If `-bind` makes the web UI reachable from other machines (such as `-bind=0.0.0.0`), anyone who can
+reach it could read the database, so grpcui does not use one unless you ask for it with `-db path`;
+each browser keeps its own history and saved requests instead.
+
+When bound to a loopback address, the web UI only answers requests addressed to localhost or a
+loopback IP, which keeps other websites from reaching it through DNS rebinding. If you reach it
+through a reverse proxy or a port forward under another host name, allow that name with
+`-allow-host`, for example `-allow-host grpcui.local`.
 
 ## Descriptor Sources
 The `grpcui` tool can operate on a variety of sources for descriptors. The descriptors

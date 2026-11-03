@@ -44,6 +44,7 @@ import (
 
 	"github.com/fullstorydev/grpcui/internal"
 	"github.com/fullstorydev/grpcui/standalone"
+	"github.com/fullstorydev/grpcui/storage"
 )
 
 var version = "dev build <no version set>"
@@ -153,20 +154,35 @@ var (
 		which lets users pick pre-defined RPC and request data, like a recipe.
 		This can be templates for common requests or could even represent a test
 		suite as a sequence of RPCs. This is similar to the "collections" feature
-		in postman. The format of this file is the same as used when saving
-		history from the gRPC UI "History" tab.`))
+		in postman. The format of this file is the same as the files the web
+		UI exports from its saved requests and from its history.`))
+	dbPath = flags.String("db", defaultDBPath(), prettify(`
+		The SQLite database file in which the web UI keeps its request history
+		and saved requests (named request bodies for each method, which can be
+		exported and imported to share them). The file and its folder are
+		created if needed, and several grpcui processes can share it. The
+		database is only used by default when the web UI is only reachable from
+		this machine (-bind is a loopback address). Otherwise anyone who can
+		reach the web UI could read it, so the web UI keeps history and saved
+		requests in each browser's local storage unless -db is given
+		explicitly. Use -db="" to never use a database.`))
 	reflection = optionalBoolFlag{val: true}
 
 	port = flags.Int("port", 0, prettify(`
 		The port on which the web UI is exposed.`))
 	bind = flags.String("bind", "127.0.0.1", prettify(`
-		The address on which the web UI is exposed.`))
+		The address on which the web UI is exposed. When it is a loopback
+		address (the default), the web UI is only reachable from this machine
+		and only answers requests whose Host header is localhost or a loopback
+		IP, which protects it against DNS rebinding (see -allow-host). For any
+		other address, the -db database is not used unless given explicitly.`))
 	basePath = flags.String("base-path", "/", prettify(`
 		The path on which the web UI is exposed.
 		Defaults to slash ("/"), which is the root of the server.
 		Example: "/debug/grpcui".`))
-	services multiString
-	methods  multiString
+	allowHosts multiString
+	services   multiString
+	methods    multiString
 
 	extraJS     multiString
 	extraCSS    multiString
@@ -229,6 +245,14 @@ func init() {
 		order given. If no import paths are given, all files (including all
 		imports) must be provided as -proto flags, and grpcui will attempt to
 		resolve all import statements from the set of file names given.`))
+	flags.Var(&allowHosts, "allow-host", prettify(`
+		A host name (without a port) that the web UI also answers to when -bind
+		is a loopback address. By default it then only accepts requests whose
+		Host header is localhost or a loopback IP, as protection against DNS
+		rebinding. Use this when the web UI is reached through a reverse proxy
+		or a port forward that sends another Host header, for example
+		-allow-host grpcui.local. Names are not case-sensitive. May specify more
+		than one via multiple -allow-host flags.`))
 	flags.Var(&services, "service", prettify(`
 		The services to expose through the web UI. If no -service and no -method
 		flags are given, the web UI will expose *all* services and methods found
@@ -406,6 +430,11 @@ func main() {
 	}
 	if (*key == "") != (*cert == "") {
 		fail(nil, "The -cert and -key arguments must be used together and both be present.")
+	}
+	for _, h := range allowHosts {
+		if err := checkAllowedHost(h); err != nil {
+			fail(nil, "The -allow-host argument %q is not valid: %v.", h, err)
+		}
 	}
 
 	if flags.NArg() != 1 {
@@ -598,8 +627,13 @@ func main() {
 		descSource = fileSource
 	}
 
-	// arrange for the RPCs to be cleanly shutdown
+	// arrange for the RPCs (and the database) to be cleanly shutdown
+	var store *storage.Store
 	reset := func() {
+		if store != nil {
+			_ = store.Close()
+			store = nil
+		}
 		if refClient != nil {
 			refClient.Reset()
 			refClient = nil
@@ -655,6 +689,24 @@ func main() {
 	handlerOpts = append(handlerOpts, configureJSandCSS(extraCSS, standalone.AddCSSFile)...)
 	handlerOpts = append(handlerOpts, configureAssets(otherAssets)...)
 	handlerOpts = append(handlerOpts, standalone.WithGRPCOptions(gRPCOptions))
+	dbExplicit := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "db" {
+			dbExplicit = true
+		}
+	})
+	dbFile, dbNotice := chooseDatabase(*bind, *dbPath, dbExplicit)
+	if dbNotice != "" {
+		fmt.Fprintln(os.Stderr, dbNotice)
+	}
+	if dbFile != "" {
+		if store, err = storage.Open(dbFile); err != nil {
+			warn("Failed to open database, so the web UI will keep history and saved requests in the browser: %v", err)
+			store = nil
+		} else {
+			handlerOpts = append(handlerOpts, standalone.WithStorage(store.Handler()))
+		}
+	}
 
 	handler := standalone.Handler(cc, target, methods, allFiles, handlerOpts...)
 	if *maxTime > 0 {
@@ -720,6 +772,14 @@ func main() {
 		handler = mux
 	}
 
+	if isLoopback(*bind) {
+		// Only answer requests addressed to this machine. This stops other
+		// websites from reaching the UI through DNS rebinding (a hostile
+		// domain that resolves to 127.0.0.1), which could otherwise read
+		// stored history and saved requests or invoke RPCs.
+		handler = requireLoopbackHost(handler, *bind, allowHosts)
+	}
+
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", *bind, *port))
 	if err != nil {
 		fail(err, "Failed to listen on port %d", *port)
@@ -757,12 +817,21 @@ Unix variants, if a -unix=true flag is present, then the address must be the
 path to the domain socket.
 
 Most flags control how the connection to the gRPC server is established. The
-web server will always bind only to localhost, without TLS, so only the port
-can be controlled via command-line flags.
+web server listens without TLS, on localhost by default (see -bind and -port).
 
 Available flags:
 `, os.Args[0])
 	flags.PrintDefaults()
+}
+
+// defaultDBPath returns the default -db path: grpcui.db in a grpcui folder
+// of the user's configuration directory, or "" if there is none.
+func defaultDBPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "grpcui", "grpcui.db")
 }
 
 func prettify(docString string) string {
@@ -1200,6 +1269,75 @@ func dumpResponse(r *http.Response, includeBody bool) (string, error) {
 		}
 	}
 	return buf.String(), nil
+}
+
+// isLoopback reports whether the bind address only accepts connections from
+// this machine.
+func isLoopback(bindAddr string) bool {
+	if strings.EqualFold(bindAddr, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(bindAddr, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// chooseDatabase returns the database file to open for the given -bind
+// address and -db path ("" for none), and whether -db was given explicitly.
+// It also returns a message to print, or "". The database holds request
+// metadata (often credentials), so when the web UI is reachable from other
+// machines it is only used if asked for.
+func chooseDatabase(bindAddr, dbPath string, explicit bool) (path, notice string) {
+	switch {
+	case dbPath == "" || isLoopback(bindAddr):
+		return dbPath, ""
+	case !explicit:
+		return "", fmt.Sprintf("The web UI is reachable from other machines (-bind=%s), so history and saved requests are kept in each browser; use -db=path to keep them in a shared database.", bindAddr)
+	default:
+		return dbPath, fmt.Sprintf("Warning: the web UI is reachable from other machines (-bind=%s), so anyone who can reach it can read the history stored in %s (including request metadata such as credentials) and its saved requests.", bindAddr, dbPath)
+	}
+}
+
+// checkAllowedHost checks an -allow-host value.
+func checkAllowedHost(host string) error {
+	switch {
+	case strings.TrimSpace(host) == "":
+		return fmt.Errorf("it is empty")
+	case strings.ContainsAny(host, "/ \t"):
+		return fmt.Errorf("it must be a host name")
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return fmt.Errorf("it must not include a port")
+	}
+	return nil
+}
+
+// normalizeHost returns a host name in the form compared by
+// requireLoopbackHost: lower case, with no brackets or trailing dot.
+func normalizeHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]")), ".")
+}
+
+// requireLoopbackHost wraps h so that it rejects requests whose Host header
+// isn't localhost, a loopback IP, the bind address or one of allowedHosts
+// (host names without a port, compared without regard to case).
+func requireLoopbackHost(h http.Handler, bindAddr string, allowedHosts []string) http.Handler {
+	allowed := map[string]bool{"localhost": true, normalizeHost(bindAddr): true}
+	for _, a := range allowedHosts {
+		allowed[normalizeHost(a)] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if hostOnly, _, err := net.SplitHostPort(host); err == nil {
+			host = hostOnly
+		}
+		host = normalizeHost(host)
+		ip := net.ParseIP(host)
+		if allowed[host] || (ip != nil && ip.IsLoopback()) {
+			h.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "grpcui only answers requests addressed to localhost", http.StatusForbidden)
+	})
 }
 
 func floatSecondsToDuration(seconds float64) time.Duration {

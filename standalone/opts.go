@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"net/http"
 	"path"
 )
 
@@ -219,6 +220,23 @@ func WithClientDebug(debug bool) HandlerOption {
 	})
 }
 
+// WithStorage makes the web UI keep its request history and saved requests
+// through the given storage API, e.g. (*storage.Store).Handler() from the
+// "github.com/fullstorydev/grpcui/storage" package, instead of in the
+// browser's local storage. The handler serves the API under "/api/" (with
+// that prefix stripped), with the same CSRF check as RPC invocations for
+// every request that is not a GET or HEAD. Closing the store, if any, is up
+// to the caller.
+//
+// The API's GET requests have no CSRF check and return everything stored,
+// including request metadata, which can hold credentials: only use this
+// option when the handler is reachable by trusted users only.
+func WithStorage(api http.Handler) HandlerOption {
+	return optFunc(func(opts *handlerOptions) {
+		opts.storage = api
+	})
+}
+
 func WithGRPCOptions(options []string) HandlerOption {
 	return optFunc(func(opts *handlerOptions) {
 		opts.gRPCurlOptions = options
@@ -246,6 +264,7 @@ type handlerOptions struct {
 	invokeVerbosity     int
 	debug               *bool
 	gRPCurlOptions      []string
+	storage             http.Handler
 }
 
 func (opts *handlerOptions) addlServedResources() []*resource {

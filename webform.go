@@ -72,6 +72,10 @@ type WebFormOptions struct {
 	Debug *bool
 	// Any options that will be rendered before grpcurl in the grpccurl/raw request box
 	GRPCurlOptions []string
+	// If set, the form stores history and saved requests through the storage
+	// API at this URI (see the storage package); otherwise it keeps them in
+	// the browser's local storage.
+	StorageURI string
 }
 
 // WebFormContentsWithOptions is the same as WebFormContents except that it
@@ -90,6 +94,7 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 		Debug:           os.Getenv("GRPC_WEBFORM_DEBUG") != "",
 		Target:          target,
 		GRPCurlOptions:  strings.Join(opts.GRPCurlOptions, " "),
+		StorageURI:      opts.StorageURI,
 	}
 	if opts.Debug != nil {
 		cfg.Debug = *opts.Debug
@@ -190,6 +195,7 @@ type webFormConfig struct {
 	Debug           bool                       `json:"debug"`
 	Target          string                     `json:"target"`
 	GRPCurlOptions  string                     `json:"grpcurlOptions"`
+	StorageURI      string                     `json:"storageURI"`
 }
 
 type webFormMethod struct {

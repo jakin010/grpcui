@@ -50,6 +50,8 @@ const ICONS = {
     "braces": '<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1"/><path d="M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"/>',
     "send": '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
     "dot": '<circle cx="12" cy="12" r="1"/>',
+    "bookmark": '<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>',
+    "pencil": '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
 };
 
 function icon(name, size, cls) {
@@ -385,7 +387,9 @@ function toast(title, opts) {
             region.setAttribute("popover", "manual");
         }
     }
-    const host = overlayHost();
+    // With the popover API the region sits in the top layer, above dialogs,
+    // so it can live at the root and outlive any dialog that is closing.
+    const host = region.showPopover ? ROOT : overlayHost();
     if (region.parentNode !== host) {
         host.appendChild(region);
     }
@@ -461,6 +465,67 @@ function confirmDialog(opts) {
     });
 }
 
+// A modal dialog with a form. opts: {title, description, body (nodes),
+// submitLabel, onReady({submit, error}), onSubmit: async () => false to stay
+// open; throwing shows the error in the dialog}. Resolves true if submitted.
+function openFormDialog(opts) {
+    return new Promise(resolve => {
+        const cancel = h("button", {type: "button", class: "btn btn-outline btn-sm"}, "Cancel");
+        const submit = h("button", {type: "submit", class: "btn btn-sm " + (opts.destructive ? "btn-destructive" : "btn-primary")}, opts.submitLabel || "Save");
+        const error = h("p", {class: "dialog-error", role: "alert"});
+        error.hidden = true;
+        const form = h("form", {class: "dialog-form", novalidate: true},
+            h("h2", {class: "dialog-title", text: opts.title}),
+            opts.description ? h("p", {class: "dialog-desc", text: opts.description}) : null,
+            h("div", {class: "dialog-fields"}, opts.body),
+            error,
+            h("div", {class: "dialog-actions"}, cancel, submit));
+        const dlg = h("dialog", {class: "dialog", "aria-label": opts.title}, form);
+        let result = false;
+        cancel.addEventListener("click", () => dlg.close());
+        form.addEventListener("submit", async e => {
+            e.preventDefault();
+            submit.disabled = true;
+            error.hidden = true;
+            try {
+                const keepOpen = (await opts.onSubmit()) === false;
+                if (!keepOpen) {
+                    result = true;
+                    dlg.close();
+                }
+            } catch (err) {
+                error.textContent = err && err.message ? err.message : String(err);
+                error.hidden = false;
+            } finally {
+                submit.disabled = false;
+            }
+        });
+        dlg.addEventListener("close", () => {
+            dlg.remove();
+            resolve(result);
+        });
+        ROOT.appendChild(dlg);
+        dlg.showModal();
+        if (opts.onReady) {
+            opts.onReady({submit: submit, error: error});
+        }
+        const first = form.querySelector("input:not([type=radio]):not([type=checkbox]), textarea");
+        if (first) {
+            first.focus();
+        }
+    });
+}
+
+// A labelled text input or textarea for dialogs.
+function dialogField(label, attrs) {
+    attrs = attrs || {};
+    const input = attrs.multiline
+        ? h("textarea", {class: "input input-sm", rows: "2", placeholder: attrs.placeholder || ""})
+        : h("input", {type: "text", class: "input input-sm", placeholder: attrs.placeholder || "", autocomplete: "off"});
+    input.value = attrs.value || "";
+    return {el: h("label", {class: "dlg-field"}, h("span", {class: "dlg-label", text: label}), input), input: input};
+}
+
 // A side panel that slides in from the right (shadcn "Sheet").
 let currentSheet = null;
 
@@ -533,8 +598,17 @@ function openMenu(anchor, items, opts) {
     if (usePopover) {
         menu.setAttribute("popover", "auto");
     }
-    const buttons = items.map(item => {
-        const btn = h("button", {type: "button", class: "menu-item", role: "menuitemradio", "aria-checked": item.checked ? "true" : "false"},
+    const buttons = [];
+    for (const item of items) {
+        if (item.separator) {
+            menu.appendChild(h("div", {class: "menu-separator", role: "separator"}));
+            continue;
+        }
+        if (item.heading) {
+            menu.appendChild(h("div", {class: "menu-heading", text: item.heading}));
+            continue;
+        }
+        const btn = h("button", {type: "button", class: "menu-item", role: item.icon && !item.checked ? "menuitem" : "menuitemradio", "aria-checked": item.checked ? "true" : "false"},
             h("span", {class: "menu-check"}, item.checked ? icon("check", 14) : (item.icon ? icon(item.icon, 14) : null)),
             h("span", {class: "menu-text"},
                 h("span", {text: item.label}),
@@ -543,9 +617,9 @@ function openMenu(anchor, items, opts) {
             close();
             item.onSelect();
         });
-        return btn;
-    });
-    buttons.forEach(b => menu.appendChild(b));
+        buttons.push(btn);
+        menu.appendChild(btn);
+    }
     menu.addEventListener("keydown", e => {
         const i = buttons.indexOf(document.activeElement);
         if (e.key === "ArrowDown") {
@@ -732,6 +806,7 @@ window.initGRPCForm = function(cfg) {
         invoking: false,
         loadSeq: 0,
         activeExample: -1,
+        activeSaved: null,
         // per-request metadata: rows, inherited names switched off for this
         // request, and whether inheritance is off entirely (history replay)
         requestRows: [],
@@ -754,7 +829,6 @@ window.initGRPCForm = function(cfg) {
         response: qs("#gu-response"),
         respStatus: qs("#gu-resp-status"),
         respCopy: qs("#gu-resp-copy"),
-        examplesBtn: qs("#gu-examples-btn"),
         globalCount: qs("#gu-global-count"),
     };
 
@@ -1275,6 +1349,7 @@ window.initGRPCForm = function(cfg) {
         state.method = method;
         if (changed) {
             state.activeExample = -1;
+            state.activeSaved = null;
             if (!opts.fromLoad) {
                 // a history replay only switches inheritance off for that request
                 state.inheritOff = false;
@@ -1289,6 +1364,7 @@ window.initGRPCForm = function(cfg) {
         renderMethodCard();
         renderMetadataSection();
         resetResponse();
+        updateSavedButton();
 
         state.schemaReady = false;
         state.schema = null;
@@ -1520,6 +1596,14 @@ window.initGRPCForm = function(cfg) {
         return resolveMetadata(chainFor(state.service, state.method));
     }
 
+    // The request's own enabled header rows, without any that only came from
+    // inherited scopes (rows filled in by a history replay are marked fromScope).
+    function ownRequestHeaders() {
+        return state.requestRows
+            .filter(r => r.enabled !== false && !r.fromScope && r.name && r.name.trim())
+            .map(r => ({name: r.name.trim(), value: r.value || ""}));
+    }
+
     // The metadata that is actually sent for the current request.
     function effectiveMetadata() {
         const request = {key: "request", rows: state.requestRows};
@@ -1548,10 +1632,12 @@ window.initGRPCForm = function(cfg) {
             });
             name.addEventListener("input", () => {
                 r.name = name.value;
+                delete r.fromScope;
                 onChange();
             });
             value.addEventListener("input", () => {
                 r.value = value.value;
+                delete r.fromScope;
                 onChange();
             });
             del.addEventListener("click", () => {
@@ -3788,6 +3874,10 @@ window.initGRPCForm = function(cfg) {
                 metadata: metadata.map(m => Object.assign({}, m)),
                 data: JSON.parse(JSON.stringify(original === undefined ? null : original)),
             },
+            // request.metadata is everything that was sent, inherited headers
+            // included; ownMetadata is just this request's own rows, which is
+            // what saving the entry as a saved request may keep
+            ownMetadata: ownRequestHeaders(),
             service: service,
             method: method,
             startTime: new Date().toISOString(),
@@ -3903,18 +3993,46 @@ window.initGRPCForm = function(cfg) {
     els.invoke.addEventListener("click", () => invoke());
 
     // ---------------------------------------------------------------------
+    // Storage
+    //
+    // History and saved requests are kept by grpcui's database when the page
+    // has a storage API (cfg.storageURI, set by the standalone handler), and
+    // in this browser's local storage otherwise. If the API can't be reached
+    // at start up, the page falls back to local storage for the session.
+    // ---------------------------------------------------------------------
+
+    const storageURI = cfg.storageURI || "";
+    let useRemote = !!storageURI;
+
+    function storageAPI(path, opts) {
+        return api(storageURI + path, opts);
+    }
+
+    function fallBackToLocal(e) {
+        if (!useRemote) {
+            return;
+        }
+        useRemote = false;
+        if (debug) {
+            console.warn("storage API unavailable", e);
+        }
+        toast("Couldn't reach grpcui's database", {
+            variant: "error",
+            description: "History and saved requests are kept in this browser for now." + (e && e.message ? "\n" + e.message : ""),
+        });
+    }
+
+    // ---------------------------------------------------------------------
     // History
     // ---------------------------------------------------------------------
 
     const maxHistory = 100;
-    const maxHistorySize = 1024 * 1024; // 1mb
-    let history = storage.getJSON(KEYS.history, []);
-    if (!Array.isArray(history)) {
-        history = [];
-    }
+    const maxHistorySize = 1024 * 1024; // 1mb, for local storage
+    let history = [];
+    let historyReady = false;
     let historyView = null;
 
-    function saveHistory() {
+    function persistLocalHistory() {
         let data = JSON.stringify(history);
         while (data.length > maxHistorySize && history.length > 0) {
             // drop the oldest entries until it fits
@@ -3924,15 +4042,118 @@ window.initGRPCForm = function(cfg) {
         if (!storage.set(KEYS.history, data) && debug) {
             console.warn("couldn't save history to local storage");
         }
+    }
+
+    function historyChanged() {
         if (historyView) {
             renderHistoryList();
         }
     }
 
+    // Moves history kept in this browser by older versions into the database, once.
+    async function migrateLocalHistory() {
+        const flagKey = KEYS.history + "-migrated";
+        if (storage.get(flagKey)) {
+            return;
+        }
+        const local = storage.getJSON(KEYS.history, []);
+        const items = (Array.isArray(local) ? local : [])
+            .filter(it => it && typeof it.service === "string" && it.service && typeof it.method === "string" && it.method)
+            .map(it => {
+                const copy = Object.assign({}, it);
+                delete copy.id;
+                if (typeof copy.startTime !== "string") {
+                    copy.startTime = new Date(0).toISOString();
+                }
+                return copy;
+            });
+        if (items.length) {
+            await storageAPI("/history/import", {method: "POST", body: {target: target, items: items}});
+        }
+        storage.set(flagKey, "1");
+    }
+
+    async function loadHistory() {
+        if (useRemote) {
+            try {
+                await migrateLocalHistory();
+                const res = await storageAPI("/history?target=" + encodeURIComponent(target));
+                history = (res && Array.isArray(res.items)) ? res.items : [];
+                historyReady = true;
+                historyChanged();
+                return;
+            } catch (e) {
+                fallBackToLocal(e);
+            }
+        }
+        const local = storage.getJSON(KEYS.history, []);
+        history = Array.isArray(local) ? local : [];
+        historyReady = true;
+        historyChanged();
+    }
+
     function addHistory(item) {
-        history = history.slice(0, maxHistory - 1);
-        history.unshift(item);
-        saveHistory();
+        history = [item].concat(history).slice(0, maxHistory);
+        if (useRemote) {
+            storageAPI("/history", {method: "POST", body: {target: target, item: item}})
+                .then(res => {
+                    if (res && !isUnset(res.id)) {
+                        item.id = res.id;
+                    }
+                })
+                .catch(e => toast("Couldn't save this call to history", {variant: "error", description: e.message}));
+        } else {
+            persistLocalHistory();
+        }
+        historyChanged();
+    }
+
+    async function deleteHistoryItem(item) {
+        if (useRemote) {
+            if (isUnset(item.id)) {
+                toast("That entry is still being saved. Try again in a moment.");
+                return;
+            }
+            try {
+                await storageAPI("/history/" + encodeURIComponent(item.id), {method: "DELETE"});
+            } catch (e) {
+                if (e.status === 404) {
+                    // already gone (another tab, or trimmed): just drop it here
+                    const gone = history.indexOf(item);
+                    if (gone >= 0) {
+                        history.splice(gone, 1);
+                    }
+                    historyChanged();
+                    return;
+                }
+                toast("Couldn't delete that entry", {variant: "error", description: e.message});
+                return;
+            }
+        }
+        const i = history.indexOf(item);
+        if (i >= 0) {
+            history.splice(i, 1);
+        }
+        if (!useRemote) {
+            persistLocalHistory();
+        }
+        historyChanged();
+    }
+
+    async function clearHistory() {
+        if (useRemote) {
+            try {
+                await storageAPI("/history?target=" + encodeURIComponent(target), {method: "DELETE"});
+            } catch (e) {
+                toast("Couldn't clear history", {variant: "error", description: e.message});
+                return;
+            }
+        }
+        history = [];
+        if (!useRemote) {
+            persistLocalHistory();
+        }
+        historyChanged();
     }
 
     function download(filename, text) {
@@ -3950,10 +4171,12 @@ window.initGRPCForm = function(cfg) {
             const item = Object.assign({}, entry);
             item.name = "Example #" + (i + 1) + " @ " + item.startTime;
             item.description = "";
+            delete item.id;
             delete item.startTime;
             delete item.durationMS;
             delete item.responseData;
             delete item.failureStatus;
+            delete item.ownMetadata;
             let req = item.request || {};
             if (Object.prototype.hasOwnProperty.call(req, "timeout")) {
                 // older entries stored a string 'timeout'
@@ -3982,6 +4205,10 @@ window.initGRPCForm = function(cfg) {
         const q = historyView.filter.value.trim().toLowerCase();
         const list = historyView.list;
         list.replaceChildren();
+        if (!historyReady) {
+            list.appendChild(h("div", {class: "gu-empty", "aria-busy": "true"}, icon("loader", 24, "spin")));
+            return;
+        }
         if (history.length === 0) {
             list.appendChild(h("div", {class: "gu-empty"}, icon("history", 28),
                 h("p", {class: "gu-empty-title", text: "No requests yet"}),
@@ -3989,7 +4216,7 @@ window.initGRPCForm = function(cfg) {
             return;
         }
         let shown = 0;
-        history.forEach((item, i) => {
+        history.forEach(item => {
             const full = item.service + "/" + item.method;
             if (q && !full.toLowerCase().includes(q)) {
                 return;
@@ -4002,6 +4229,7 @@ window.initGRPCForm = function(cfg) {
                 meta.push(plural(count, "message"));
             }
             const load = h("button", {type: "button", class: "btn btn-outline btn-xs", disabled: !valid}, "Load");
+            const save = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Save as a saved request", "data-tooltip": "Save as a saved request"}, icon("bookmark", 14));
             const del = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Delete entry", "data-tooltip": "Delete"}, icon("trash", 14));
             const summary = h("summary", {class: "hist-summary"},
                 icon("chevron-down", 14, "chevron"),
@@ -4009,7 +4237,7 @@ window.initGRPCForm = function(cfg) {
                 h("div", {class: "hist-main"},
                     h("div", {class: "hist-method mono" + (valid ? "" : " invalid"), text: splitService(item.service).name + "/" + item.method, title: valid ? full : full + " (no longer available)"}),
                     h("div", {class: "hist-meta", text: meta.filter(Boolean).join(" · ")})),
-                h("div", {class: "hist-actions"}, load, del));
+                h("div", {class: "hist-actions"}, load, save, del));
             const details = h("details", {class: "hist-item"}, summary);
             details.addEventListener("toggle", () => {
                 if (details.open && !details._built) {
@@ -4030,11 +4258,16 @@ window.initGRPCForm = function(cfg) {
                 closeSheet();
                 loadRequest(item, {fromHistory: true});
             });
+            save.addEventListener("click", e => {
+                e.preventDefault();
+                e.stopPropagation();
+                const req = Object.assign({}, item.request, {metadata: Array.isArray(item.ownMetadata) ? item.ownMetadata : []});
+                openSaveDialog(normalizeSaved({service: item.service, method: item.method, request: req}));
+            });
             del.addEventListener("click", e => {
                 e.preventDefault();
                 e.stopPropagation();
-                history.splice(i, 1);
-                saveHistory();
+                deleteHistoryItem(item);
             });
             list.appendChild(details);
         });
@@ -4050,7 +4283,7 @@ window.initGRPCForm = function(cfg) {
         const clearBtn = h("button", {type: "button", class: "btn btn-ghost btn-sm text-destructive"}, icon("trash", 14), "Clear history");
         openSheet({
             title: "History",
-            description: "The last " + maxHistory + " requests sent to this server from this browser.",
+            description: "The last " + maxHistory + " calls to this server, " + (useRemote ? "kept in grpcui's database on this computer." : "kept in this browser."),
             body: [h("div", {class: "hist-filter"}, filter), list],
             footer: [clearBtn, h("div", {class: "gu-spacer"}), exportBtn],
             onClose: () => {
@@ -4064,13 +4297,12 @@ window.initGRPCForm = function(cfg) {
         clearBtn.addEventListener("click", async () => {
             const ok = await confirmDialog({
                 title: "Clear history?",
-                description: "This deletes every saved request for this server from this browser. You can't undo this.",
+                description: "This deletes every call to this server from history. Saved requests aren't affected. You can't undo this.",
                 confirmLabel: "Clear history",
                 destructive: true,
             });
             if (ok) {
-                history = [];
-                saveHistory();
+                clearHistory();
             }
         });
         renderHistoryList();
@@ -4078,7 +4310,7 @@ window.initGRPCForm = function(cfg) {
 
     qs("#gu-history-btn").addEventListener("click", openHistory);
 
-    // Loads a history entry or example into the form.
+    // Loads a history entry, example or saved request into the form.
     function loadRequest(item, opts) {
         opts = opts || {};
         const req = item.request || {};
@@ -4086,7 +4318,7 @@ window.initGRPCForm = function(cfg) {
             toast("That method isn't available on this server", {variant: "error", description: item.service + "/" + item.method});
             return;
         }
-        // older versions stored 'timeout'; examples use 'timeout_secs'
+        // older versions stored 'timeout'; examples and saved requests use 'timeout_secs'
         let t = req.timeout_seconds;
         if (isUnset(t)) {
             t = req.timeout_secs;
@@ -4097,7 +4329,18 @@ window.initGRPCForm = function(cfg) {
         els.timeout.value = isUnset(t) ? "" : String(t);
         markValid(els.timeout);
 
-        state.requestRows = (req.metadata || []).map(m => ({name: m.name || "", value: m.value || "", enabled: true}));
+        // A history replay restores every header that was sent. Mark the ones
+        // that weren't the request's own (older entries didn't record that, so
+        // all of theirs), so saving the request later doesn't capture them.
+        const own = opts.fromHistory ? (Array.isArray(item.ownMetadata) ? item.ownMetadata : []) : null;
+        const isOwn = m => !own || own.some(o => o.name === m.name && o.value === m.value);
+        state.requestRows = (req.metadata || []).map(m => {
+            const row = {name: m.name || "", value: m.value || "", enabled: true};
+            if (!isOwn(m)) {
+                row.fromScope = true;
+            }
+            return row;
+        });
         state.skipInherited = new Set();
         state.inheritOff = !!opts.fromHistory;
         validation = null;
@@ -4120,28 +4363,695 @@ window.initGRPCForm = function(cfg) {
             },
         });
         state.activeExample = isUnset(opts.exampleIndex) ? -1 : opts.exampleIndex;
+        state.activeSaved = isUnset(opts.savedId) ? null : opts.savedId;
     }
 
     // ---------------------------------------------------------------------
-    // Examples (only served by the standalone handler)
+    // Saved requests
+    //
+    // Named request bodies (plus timeout and the request's own headers) for
+    // a method, meant for sharing. The export file uses the same format as
+    // the -examples flag, so a shared file also works as grpcui -examples.
     // ---------------------------------------------------------------------
 
+    const savedLocalKey = `grpcui-saved-${host}`;
+    let savedItems = [];
+    let savedReady = false;
+    let savedView = null;
     let examples = [];
 
-    els.examplesBtn.addEventListener("click", () => {
-        openMenu(els.examplesBtn, examples.map((ex, i) => ({
-            label: ex.name || ("Example " + (i + 1)),
-            description: ex.description || (ex.service + "/" + ex.method),
-            checked: i === state.activeExample,
-            onSelect: () => loadRequest(ex, {exampleIndex: i}),
-        })), {align: "end"});
+    // JSON with object keys sorted, for spotting duplicates (matches the
+    // server, which re-encodes through a Go map).
+    function canonicalJSON(v) {
+        if (Array.isArray(v)) {
+            return "[" + v.map(canonicalJSON).join(",") + "]";
+        }
+        if (v && typeof v === "object") {
+            return "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonicalJSON(v[k])).join(",") + "}";
+        }
+        const s = JSON.stringify(v);
+        return s === undefined ? "null" : s;
+    }
+
+    // Accepts a saved request, an -examples entry or a history entry and
+    // returns {name, description, service, method, request:{timeout_secs?, metadata?, data}}.
+    function normalizeSaved(raw) {
+        raw = raw || {};
+        const req = raw.request || {};
+        let t = req.timeout_secs;
+        if (isUnset(t)) {
+            t = req.timeout_seconds;
+        }
+        if (isUnset(t) && !isUnset(req.timeout) && req.timeout !== "") {
+            t = Number(req.timeout);
+        }
+        const out = {
+            name: String(isUnset(raw.name) ? "" : raw.name).trim(),
+            description: String(isUnset(raw.description) ? "" : raw.description).trim(),
+            service: String(isUnset(raw.service) ? "" : raw.service).trim(),
+            method: String(isUnset(raw.method) ? "" : raw.method).trim(),
+            request: {},
+        };
+        if (typeof t === "number" && isFinite(t) && t > 0) {
+            out.request.timeout_secs = t;
+        }
+        const md = (Array.isArray(req.metadata) ? req.metadata : [])
+            .filter(m => m && !isUnset(m.name) && String(m.name).trim())
+            .map(m => ({name: String(m.name).trim(), value: isUnset(m.value) ? "" : String(m.value)}));
+        if (md.length) {
+            out.request.metadata = md;
+        }
+        out.request.data = req.data;
+        return out;
+    }
+
+    function checkSaved(item, where) {
+        const prefix = where ? where + ": " : "";
+        if (!item.service || !item.method) {
+            throw new Error(prefix + "it needs a service and a method.");
+        }
+        if (!item.name) {
+            throw new Error(prefix + "it needs a name.");
+        }
+        if (isUnset(item.request.data)) {
+            throw new Error(prefix + "it has no request data.");
+        }
+    }
+
+    function savedKey(item) {
+        return [item.service, item.method, item.name, canonicalJSON(item.request)].join("\u0000");
+    }
+
+    function localSaved() {
+        const v = storage.getJSON(savedLocalKey, []);
+        return Array.isArray(v) ? v : [];
+    }
+
+    function writeLocalSaved(items) {
+        if (!storage.setJSON(savedLocalKey, items)) {
+            throw new Error("This browser's storage is full or turned off.");
+        }
+    }
+
+    // Same promise-based interface for the database and local storage.
+    const savedStore = {
+        async list() {
+            if (useRemote) {
+                const res = await storageAPI("/saved");
+                return (res && Array.isArray(res.items)) ? res.items : [];
+            }
+            return localSaved();
+        },
+        async create(item) {
+            checkSaved(item);
+            if (useRemote) {
+                return storageAPI("/saved", {method: "POST", body: item});
+            }
+            const items = localSaved();
+            const now = new Date().toISOString();
+            const stored = Object.assign({}, item, {id: items.reduce((m, x) => Math.max(m, x.id || 0), 0) + 1, createdAt: now, updatedAt: now});
+            items.push(stored);
+            writeLocalSaved(items);
+            return stored;
+        },
+        async update(id, item) {
+            checkSaved(item);
+            if (useRemote) {
+                return storageAPI("/saved/" + encodeURIComponent(id), {method: "PUT", body: item});
+            }
+            const items = localSaved();
+            const i = items.findIndex(x => x.id === id);
+            if (i < 0) {
+                throw new Error("That saved request no longer exists.");
+            }
+            items[i] = Object.assign({}, item, {id: id, createdAt: items[i].createdAt, updatedAt: new Date().toISOString()});
+            writeLocalSaved(items);
+            return items[i];
+        },
+        async remove(id) {
+            if (useRemote) {
+                try {
+                    await storageAPI("/saved/" + encodeURIComponent(id), {method: "DELETE"});
+                } catch (e) {
+                    if (e.status !== 404) {
+                        throw e; // 404: already deleted, e.g. in another tab
+                    }
+                }
+                return;
+            }
+            writeLocalSaved(localSaved().filter(x => x.id !== id));
+        },
+        async importItems(items) {
+            items.forEach((it, i) => checkSaved(it, "Item " + (i + 1)));
+            if (useRemote) {
+                return storageAPI("/saved/import", {method: "POST", body: {items: items}});
+            }
+            const existing = localSaved();
+            // also count "name (2)" copies from earlier imports as duplicates,
+            // so importing the same file again adds nothing (like the server)
+            const seen = new Set();
+            for (const x of existing) {
+                const n = normalizeSaved(x);
+                seen.add(savedKey(n));
+                const m = /^(.*) \((\d+)\)$/.exec(n.name);
+                if (m && Number(m[2]) >= 2) {
+                    seen.add(savedKey(Object.assign({}, n, {name: m[1]})));
+                }
+            }
+            let nextId = existing.reduce((m, x) => Math.max(m, x.id || 0), 0) + 1;
+            const now = new Date().toISOString();
+            let imported = 0;
+            let skipped = 0;
+            let renamed = 0;
+            const taken = new Set(existing.map(x => [x.service, x.method, x.name].join("\u0000")));
+            for (const it of items) {
+                const key = savedKey(it);
+                if (seen.has(key)) {
+                    skipped++;
+                    continue;
+                }
+                seen.add(key);
+                // same name, different request: keep both, as "name (2)", ...
+                let name = it.name;
+                const nameKey = n => [it.service, it.method, n].join("\u0000");
+                if (taken.has(nameKey(name))) {
+                    let n = 2;
+                    while (taken.has(nameKey(it.name + " (" + n + ")"))) {
+                        n++;
+                    }
+                    name = it.name + " (" + n + ")";
+                    renamed++;
+                }
+                taken.add(nameKey(name));
+                existing.push(Object.assign({}, it, {name: name, id: nextId++, createdAt: now, updatedAt: now}));
+                imported++;
+            }
+            writeLocalSaved(existing);
+            return {imported: imported, skipped: skipped, renamed: renamed};
+        },
+    };
+
+    function compareSaved(a, b) {
+        return a.service.localeCompare(b.service) || a.method.localeCompare(b.method) ||
+            a.name.localeCompare(b.name) || ((a.id || 0) - (b.id || 0));
+    }
+
+    // Moves saved requests kept in this browser (before a database was in
+    // use) into the database, once. Exact duplicates are skipped by the server.
+    async function migrateLocalSaved() {
+        const flagKey = savedLocalKey + "-migrated";
+        if (!useRemote || storage.get(flagKey)) {
+            return;
+        }
+        const items = localSaved().map(normalizeSaved).filter(it => {
+            try {
+                checkSaved(it);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        });
+        if (items.length) {
+            await storageAPI("/saved/import", {method: "POST", body: {items: items}});
+        }
+        storage.set(flagKey, "1");
+    }
+
+    async function reloadSaved() {
+        try {
+            if (!savedReady) {
+                await migrateLocalSaved();
+            }
+            savedItems = (await savedStore.list()).slice().sort(compareSaved);
+        } catch (e) {
+            if (!savedReady) {
+                // first load: use this browser's copy (fallBackToLocal is a
+                // no-op if history already switched to local mode)
+                fallBackToLocal(e);
+                savedItems = localSaved().slice().sort(compareSaved);
+            } else {
+                toast("Couldn't load saved requests", {variant: "error", description: e.message});
+            }
+        }
+        savedReady = true;
+        if (savedView) {
+            const ids = new Set(savedItems.map(s => s.id));
+            savedView.selected = new Set(Array.from(savedView.selected).filter(id => ids.has(id)));
+            renderSavedList();
+        }
+        updateSavedButton();
+    }
+
+    // ----- Saved menu in the request header -----
+
+    const savedBtn = qs("#gu-saved-btn");
+    const savedCount = qs("#gu-saved-count");
+
+    function savedForCurrent() {
+        return savedItems.filter(s => s.service === state.service && s.method === state.method);
+    }
+
+    function updateSavedButton() {
+        if (!savedCount) {
+            return;
+        }
+        const n = savedForCurrent().length;
+        savedCount.textContent = String(n);
+        savedCount.hidden = n === 0;
+        savedBtn.setAttribute("aria-label", "Saved requests" + (n ? " (" + n + " for this method)" : ""));
+    }
+
+    // The request as it is now: body, timeout and the request's own headers
+    // (inherited metadata is not included).
+    function currentRequestSnapshot() {
+        const request = {data: JSON.parse(JSON.stringify(state.request === undefined ? null : state.request))};
+        const t = parseTimeout();
+        if (t) {
+            request.timeout_secs = t;
+        }
+        const md = ownRequestHeaders();
+        if (md.length) {
+            request.metadata = md;
+        }
+        const out = {service: state.service, method: state.method, request: request, fromCurrent: true};
+        const active = savedItems.find(s => s.id === state.activeSaved && s.service === state.service && s.method === state.method);
+        if (active) {
+            out.defaultName = active.name;
+            out.defaultDescription = active.description || "";
+        }
+        return out;
+    }
+
+    function saveCurrentRequest() {
+        if (!state.service || !state.schemaReady) {
+            return;
+        }
+        if (!onlyIfValid()) {
+            return;
+        }
+        openSaveDialog(currentRequestSnapshot());
+    }
+
+    function openSaveDialog(src) {
+        const nameF = dialogField("Name", {placeholder: "Valid order with two items"});
+        const descF = dialogField("Description", {placeholder: "Optional", multiline: true});
+        const mdCount = (src.request.metadata || []).length;
+        const parts = ["the request body"];
+        if (src.request.timeout_secs) {
+            parts.push("timeout");
+        }
+        if (mdCount) {
+            parts.push(plural(mdCount, "header") + " set on this request");
+        }
+        const what = parts.length > 1 ? parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1] : parts[0];
+        const info = h("p", {class: "dlg-hint"}, "Saves " + what + " for ", h("span", {class: "mono", text: splitService(src.service).name + "/" + src.method}), ". Inherited metadata isn't included.");
+        const replaceHint = h("p", {class: "dlg-hint dlg-warn", text: "A saved request with this name already exists for this method. Saving replaces it."});
+        replaceHint.hidden = true;
+        let submitBtn = null;
+        const existingFor = name => savedItems.find(s => s.service === src.service && s.method === src.method && s.name === name.trim());
+        const sync = () => {
+            const ex = existingFor(nameF.input.value);
+            replaceHint.hidden = !ex;
+            if (submitBtn) {
+                submitBtn.textContent = ex ? "Replace" : "Save";
+            }
+        };
+        nameF.input.addEventListener("input", sync);
+        if (src.defaultName) {
+            nameF.input.value = src.defaultName;
+            descF.input.value = src.defaultDescription || "";
+        }
+        openFormDialog({
+            title: "Save request",
+            body: [nameF.el, descF.el, info, replaceHint],
+            submitLabel: "Save",
+            onReady: r => {
+                submitBtn = r.submit;
+                sync();
+                nameF.input.select();
+            },
+            onSubmit: async () => {
+                const name = nameF.input.value.trim();
+                if (!name) {
+                    nameF.input.focus();
+                    throw new Error("Enter a name.");
+                }
+                const item = {name: name, description: descF.input.value.trim(), service: src.service, method: src.method, request: src.request};
+                const ex = existingFor(name);
+                let stored;
+                try {
+                    stored = ex ? await savedStore.update(ex.id, item) : await savedStore.create(item);
+                } catch (e) {
+                    if (!ex || e.status !== 404) {
+                        throw e;
+                    }
+                    stored = await savedStore.create(item); // it was deleted elsewhere
+                }
+                await reloadSaved();
+                if (src.fromCurrent && stored && !isUnset(stored.id)) {
+                    state.activeSaved = stored.id;
+                }
+                toast(ex ? "Saved request replaced" : "Request saved", {variant: "success", description: name});
+            },
+        });
+    }
+
+    savedBtn.addEventListener("click", () => {
+        const items = [];
+        const mine = savedForCurrent();
+        if (mine.length) {
+            items.push({heading: "Saved for " + (state.method || "this method")});
+            mine.forEach(s => items.push({
+                label: s.name,
+                description: s.description,
+                checked: s.id === state.activeSaved,
+                onSelect: () => loadRequest(s, {savedId: s.id}),
+            }));
+        }
+        if (examples.length) {
+            const ordered = examples.map((ex, i) => ({ex: ex, i: i}))
+                .sort((a, b) => Number(b.ex.service === state.service && b.ex.method === state.method) - Number(a.ex.service === state.service && a.ex.method === state.method));
+            items.push({heading: "Examples"});
+            ordered.forEach(x => items.push({
+                label: x.ex.name || ("Example " + (x.i + 1)),
+                description: x.ex.description || (x.ex.service + "/" + x.ex.method),
+                checked: x.i === state.activeExample,
+                onSelect: () => loadRequest(x.ex, {exampleIndex: x.i}),
+            }));
+        }
+        if (!mine.length && !examples.length) {
+            items.push({heading: savedReady ? "Nothing saved for this method yet" : "Loading…"});
+        }
+        items.push({separator: true});
+        items.push({label: "Save current request…", icon: "plus", description: IS_MAC ? "⌘S" : "Ctrl S", onSelect: saveCurrentRequest});
+        items.push({label: "Manage saved requests…", icon: "bookmark", onSelect: openSavedSheet});
+        openMenu(savedBtn, items, {align: "end"});
     });
+
+    // ----- Saved requests panel -----
+
+    function openSavedSheet() {
+        const filter = h("input", {type: "search", class: "input input-sm", placeholder: "Filter by name, service or method", "aria-label": "Filter saved requests", autocomplete: "off"});
+        const selectAll = h("input", {type: "checkbox", class: "checkbox", "aria-label": "Select all shown"});
+        const list = h("div", {class: "saved-list"});
+        const selCount = h("span", {class: "muted text-sm"});
+        const fileInput = h("input", {type: "file", accept: "application/json,.json", class: "sr-only", tabindex: "-1", "aria-hidden": "true"});
+        const importBtn = h("button", {type: "button", class: "btn btn-outline btn-sm"}, icon("upload", 14), "Import");
+        const exportBtn = h("button", {type: "button", class: "btn btn-primary btn-sm"}, icon("download", 14), "Export…");
+        openSheet({
+            title: "Saved requests",
+            description: (useRemote ? "Kept in grpcui's database on this computer." : "Kept in this browser.") +
+                " Export them to share with other people, or import a file someone shared with you.",
+            body: [h("div", {class: "saved-toolbar"}, h("label", {class: "saved-check", "data-tooltip": "Select all shown"}, selectAll), filter), list, fileInput],
+            footer: [selCount, h("div", {class: "gu-spacer"}), importBtn, exportBtn],
+            onClose: () => {
+                savedView = null;
+            },
+            initialFocus: filter,
+        });
+        savedView = {filter: filter, list: list, selectAll: selectAll, selCount: selCount, exportBtn: exportBtn, selected: new Set()};
+        filter.addEventListener("input", renderSavedList);
+        selectAll.addEventListener("change", () => {
+            const shown = visibleSaved();
+            shown.forEach(s => selectAll.checked ? savedView.selected.add(s.id) : savedView.selected.delete(s.id));
+            renderSavedList();
+        });
+        importBtn.addEventListener("click", () => fileInput.click());
+        fileInput.addEventListener("change", () => {
+            const file = fileInput.files && fileInput.files[0];
+            fileInput.value = "";
+            if (file) {
+                importSavedFile(file);
+            }
+        });
+        exportBtn.addEventListener("click", openExportDialog);
+        renderSavedList();
+    }
+
+    function visibleSaved() {
+        const q = savedView.filter.value.trim().toLowerCase();
+        if (!q) {
+            return savedItems;
+        }
+        return savedItems.filter(s => [s.name, s.description || "", s.service, s.method, s.service + "/" + s.method]
+            .some(v => v.toLowerCase().includes(q)));
+    }
+
+    // Sets a group checkbox to checked / unchecked / mixed for the given ids.
+    function setGroupCheck(box, ids) {
+        const n = ids.filter(id => savedView.selected.has(id)).length;
+        box.checked = n > 0 && n === ids.length;
+        box.indeterminate = n > 0 && n < ids.length;
+    }
+
+    function groupCheckbox(ids, label) {
+        const box = h("input", {type: "checkbox", class: "checkbox", "aria-label": "Select " + label});
+        setGroupCheck(box, ids);
+        box.addEventListener("change", () => {
+            ids.forEach(id => box.checked ? savedView.selected.add(id) : savedView.selected.delete(id));
+            renderSavedList();
+        });
+        return box;
+    }
+
+    function renderSavedList() {
+        const v = savedView;
+        const list = v.list;
+        list.replaceChildren();
+        const total = savedItems.length;
+        const nSel = v.selected.size;
+        v.selCount.textContent = total ? (nSel ? nSel + " of " + total + " selected" : plural(total, "saved request")) : "";
+        v.exportBtn.disabled = total === 0;
+        if (!savedReady) {
+            list.appendChild(h("div", {class: "gu-empty", "aria-busy": "true"}, icon("loader", 24, "spin")));
+            return;
+        }
+        if (total === 0) {
+            list.appendChild(h("div", {class: "gu-empty"}, icon("bookmark", 28),
+                h("p", {class: "gu-empty-title", text: "No saved requests yet"}),
+                h("p", {class: "gu-empty-desc", text: "Use Saved › Save current request, or import a file someone shared with you."})));
+            setGroupCheck(v.selectAll, []);
+            return;
+        }
+        const shown = visibleSaved();
+        setGroupCheck(v.selectAll, shown.map(s => s.id));
+        if (shown.length === 0) {
+            list.appendChild(h("p", {class: "muted text-sm", style: {padding: "12px 0"}, text: "Nothing matches “" + v.filter.value.trim() + "”."}));
+            return;
+        }
+        // group: service -> method -> items (savedItems is already sorted)
+        const bySvc = new Map();
+        for (const s of shown) {
+            if (!bySvc.has(s.service)) {
+                bySvc.set(s.service, new Map());
+            }
+            const byMethod = bySvc.get(s.service);
+            if (!byMethod.has(s.method)) {
+                byMethod.set(s.method, []);
+            }
+            byMethod.get(s.method).push(s);
+        }
+        for (const [svc, byMethod] of bySvc) {
+            const svcIds = Array.from(byMethod.values()).flat().map(s => s.id);
+            const group = h("section", {class: "saved-svc"},
+                h("div", {class: "saved-svc-head"},
+                    h("label", {class: "saved-check"}, groupCheckbox(svcIds, "all of " + svc)),
+                    icon("server", 14, "muted"),
+                    h("span", {class: "mono saved-svc-name", text: svc, title: svc})));
+            for (const [method, items] of byMethod) {
+                const available = hasMethod(svc, method);
+                group.appendChild(h("div", {class: "saved-method-head"},
+                    h("label", {class: "saved-check"}, groupCheckbox(items.map(s => s.id), "all of " + method)),
+                    h("span", {class: "mono", text: method}),
+                    available ? null : h("span", {class: "badge badge-outline", "data-tooltip": "This server doesn't have this method, so these can't be loaded here.", text: "not on this server"})));
+                for (const s of items) {
+                    group.appendChild(savedRow(s, available));
+                }
+            }
+            list.appendChild(group);
+        }
+    }
+
+    function savedRow(s, available) {
+        const box = h("input", {type: "checkbox", class: "checkbox", checked: savedView.selected.has(s.id), "aria-label": "Select " + s.name});
+        box.addEventListener("change", () => {
+            if (box.checked) {
+                savedView.selected.add(s.id);
+            } else {
+                savedView.selected.delete(s.id);
+            }
+            renderSavedList();
+        });
+        const load = h("button", {type: "button", class: "btn btn-outline btn-xs", disabled: !available}, "Load");
+        const edit = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Rename " + s.name, "data-tooltip": "Rename or describe"}, icon("pencil", 13));
+        const del = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Delete " + s.name, "data-tooltip": "Delete"}, icon("trash", 14));
+        load.addEventListener("click", () => {
+            closeSheet();
+            loadRequest(s, {savedId: s.id});
+        });
+        edit.addEventListener("click", () => openEditSavedDialog(s));
+        del.addEventListener("click", async () => {
+            const ok = await confirmDialog({
+                title: "Delete “" + s.name + "”?",
+                description: "This removes the saved request for " + s.method + ". You can't undo this.",
+                confirmLabel: "Delete",
+                destructive: true,
+            });
+            if (!ok) {
+                return;
+            }
+            try {
+                await savedStore.remove(s.id);
+                if (state.activeSaved === s.id) {
+                    state.activeSaved = null;
+                }
+                await reloadSaved();
+            } catch (e) {
+                toast("Couldn't delete that saved request", {variant: "error", description: e.message});
+            }
+        });
+        const meta = [];
+        const req = s.request || {};
+        if (req.metadata && req.metadata.length) {
+            meta.push(plural(req.metadata.length, "header"));
+        }
+        if (req.timeout_secs) {
+            meta.push(req.timeout_secs + " s timeout");
+        }
+        return h("div", {class: "saved-item" + (s.id === state.activeSaved ? " active" : "")},
+            h("label", {class: "saved-check"}, box),
+            h("div", {class: "saved-main"},
+                h("div", {class: "saved-name", text: s.name}),
+                s.description ? h("div", {class: "saved-desc", text: s.description}) : null,
+                meta.length ? h("div", {class: "saved-meta", text: meta.join(" · ")}) : null),
+            h("div", {class: "hist-actions"}, load, edit, del));
+    }
+
+    function openEditSavedDialog(s) {
+        const nameF = dialogField("Name", {value: s.name});
+        const descF = dialogField("Description", {value: s.description || "", placeholder: "Optional", multiline: true});
+        openFormDialog({
+            title: "Edit saved request",
+            body: [nameF.el, descF.el, h("p", {class: "dlg-hint"}, "To change the request itself, load it, edit it and save it again under the same name.")],
+            submitLabel: "Save",
+            onSubmit: async () => {
+                const name = nameF.input.value.trim();
+                if (!name) {
+                    throw new Error("Enter a name.");
+                }
+                const clash = savedItems.find(x => x.id !== s.id && x.service === s.service && x.method === s.method && x.name === name);
+                if (clash) {
+                    throw new Error("Another saved request for " + s.method + " already has that name.");
+                }
+                await savedStore.update(s.id, normalizeSaved(Object.assign({}, s, {name: name, description: descF.input.value.trim()})));
+                await reloadSaved();
+            },
+        });
+    }
+
+    // Shape written to export files: the -examples format.
+    function exportShape(s, includeMetadata) {
+        const req = s.request || {};
+        const out = {name: s.name};
+        if (s.description) {
+            out.description = s.description;
+        }
+        out.service = s.service;
+        out.method = s.method;
+        out.request = {};
+        if (!isUnset(req.timeout_secs)) {
+            out.request.timeout_secs = req.timeout_secs;
+        }
+        if (includeMetadata && Array.isArray(req.metadata) && req.metadata.length) {
+            out.request.metadata = req.metadata;
+        }
+        out.request.data = req.data;
+        return out;
+    }
+
+    function openExportDialog() {
+        const total = savedItems.length;
+        const selected = savedView ? savedItems.filter(s => savedView.selected.has(s.id)) : [];
+        const radioAll = h("input", {type: "radio", name: "gu-export-scope", value: "all", checked: selected.length === 0});
+        const radioSel = h("input", {type: "radio", name: "gu-export-scope", value: "selected", checked: selected.length > 0, disabled: selected.length === 0});
+        const mdSwitch = h("input", {type: "checkbox", class: "switch", "aria-label": "Include metadata"});
+        const withMd = savedItems.filter(s => s.request && s.request.metadata && s.request.metadata.length).length;
+        openFormDialog({
+            title: "Export saved requests",
+            description: "Downloads a JSON file you can share. Others can import it here, or pass it to grpcui -examples.",
+            body: [
+                h("div", {class: "dlg-choices", role: "radiogroup", "aria-label": "What to export"},
+                    h("label", {class: "dlg-choice"}, radioAll, h("span", null, "All saved requests ", h("span", {class: "muted", text: "(" + total + ")"}))),
+                    h("label", {class: "dlg-choice" + (selected.length ? "" : " disabled")}, radioSel,
+                        h("span", null, "Only the selected ones ", h("span", {class: "muted", text: selected.length ? "(" + selected.length + ")" : "(select some in the list first)"})))),
+                h("label", {class: "dlg-switch"}, mdSwitch,
+                    h("span", null,
+                        h("span", {class: "dlg-label", text: "Include metadata"}),
+                        h("span", {class: "dlg-hint", text: "Headers can hold tokens or passwords. Leave this off unless everyone you share the file with should have them." + (withMd ? "" : " (None of your saved requests have headers.)")}))),
+            ],
+            submitLabel: "Export",
+            onSubmit: async () => {
+                const items = radioSel.checked ? selected : savedItems;
+                if (!items.length) {
+                    throw new Error("There's nothing to export.");
+                }
+                const out = items.map(s => exportShape(s, mdSwitch.checked));
+                const stamp = new Date().toISOString().slice(0, 10);
+                download("grpcui-saved-requests-" + stamp + ".json", JSON.stringify(out, null, 2) + "\n");
+                toast("Exported " + plural(out.length, "saved request"), {variant: "success", description: mdSwitch.checked ? "Metadata included." : "Metadata left out."});
+            },
+        });
+    }
+
+    function importSavedFile(file) {
+        const reader = new FileReader();
+        reader.addEventListener("load", async () => {
+            let parsed;
+            try {
+                parsed = JSON.parse(String(reader.result));
+            } catch (e) {
+                toast("That file isn't valid JSON", {variant: "error", description: file.name});
+                return;
+            }
+            const list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.items) ? parsed.items : null);
+            if (!list) {
+                toast("That file doesn't hold saved requests", {variant: "error", description: "Expected a list like the one Export writes."});
+                return;
+            }
+            const items = list.map(normalizeSaved);
+            try {
+                const res = await savedStore.importItems(items);
+                await reloadSaved();
+                const imported = res && typeof res.imported === "number" ? res.imported : items.length;
+                const skipped = res && typeof res.skipped === "number" ? res.skipped : 0;
+                const renamedN = res && typeof res.renamed === "number" ? res.renamed : 0;
+                const notes = [];
+                if (skipped) {
+                    notes.push(plural(skipped, "duplicate") + " already saved, so skipped.");
+                }
+                if (renamedN) {
+                    notes.push(plural(renamedN, "request") + " had the name of a different saved request, so " + (renamedN === 1 ? "it got" : "they got") + " a number added, like “Name (2)”.");
+                }
+                toast("Imported " + plural(imported, "saved request"), {
+                    variant: "success",
+                    description: notes.length ? notes.join(" ") : file.name,
+                });
+            } catch (e) {
+                toast("Couldn't import " + file.name, {variant: "error", description: e.message});
+            }
+        });
+        reader.addEventListener("error", () => toast("Couldn't read " + file.name, {variant: "error"}));
+        reader.readAsText(file);
+    }
+
+    // ---------------------------------------------------------------------
+    // Examples (only served by the standalone handler, from -examples)
+    // ---------------------------------------------------------------------
 
     api("examples")
         .then(data => {
-            if (Array.isArray(data) && data.length > 0) {
+            if (Array.isArray(data)) {
                 examples = data;
-                els.examplesBtn.hidden = false;
             }
         })
         .catch(e => {
@@ -4149,6 +5059,10 @@ window.initGRPCForm = function(cfg) {
                 console.log("no examples: " + e.message);
             }
         });
+
+    // one after the other, so that only one of them decides whether the
+    // database is reachable
+    loadHistory().then(reloadSaved);
 
     // ---------------------------------------------------------------------
     // Start up
@@ -4166,6 +5080,12 @@ window.initGRPCForm = function(cfg) {
             }
             e.preventDefault();
             invoke();
+        } else if (mod && !e.shiftKey && (e.key === "s" || e.key === "S")) {
+            if (document.querySelector("dialog[open]")) {
+                return;
+            }
+            e.preventDefault();
+            saveCurrentRequest();
         } else if (mod && (e.key === "k" || e.key === "K")) {
             if (document.querySelector("dialog[open]")) {
                 return;
