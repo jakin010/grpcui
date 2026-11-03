@@ -1393,6 +1393,91 @@
     color: hsl(var(--muted-foreground));
 }
 
+/* collapsible sections in the form */
+.grpcui .gu-form .collapse-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: center;
+    flex: none;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: hsl(var(--muted-foreground));
+    cursor: pointer;
+}
+
+.grpcui .gu-form .collapse-toggle:hover {
+    background: hsl(var(--accent));
+    color: hsl(var(--foreground));
+}
+
+.grpcui .gu-form .collapse-toggle .icon {
+    transition: transform 0.15s;
+}
+
+.grpcui .gu-form tr.collapsed > td > .collapse-toggle .icon {
+    transform: rotate(-90deg);
+}
+
+/* nothing to collapse while an optional message is unset */
+.grpcui .gu-form tr.collapsible:has(> td > .null) > .field-label > .collapse-toggle {
+    visibility: hidden;
+}
+
+.grpcui .gu-form .field-summary, .grpcui .gu-form .item-summary {
+    display: none;
+    align-items: center;
+    align-self: center;
+    height: 20px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 999px;
+    background: hsl(var(--muted));
+    color: hsl(var(--muted-foreground));
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 400;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.grpcui .gu-form .field-summary:hover, .grpcui .gu-form .item-summary:hover {
+    color: hsl(var(--foreground));
+}
+
+.grpcui .gu-form tr.collapsed > .field-label > .field-summary {
+    display: inline-flex;
+}
+
+.grpcui .gu-form tr.message_field.collapsed > td:not(.field-label):not(.field-presence):not(.oneof-radio) {
+    display: none;
+}
+
+.grpcui .gu-form tr.array_element.collapsed > .array-value > :not(.item-summary) {
+    display: none;
+}
+
+.grpcui .gu-form tr.array_element.collapsed > .array-value > .item-summary {
+    display: inline-flex;
+    margin-top: 3px;
+}
+
+.grpcui .gu-form .array-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+}
+
+.grpcui .gu-form .array-actions .collapse-toggle {
+    width: 26px;
+    height: 26px;
+}
+
 .grpcui .gu-form .oneof {
     padding: 2px 12px;
     border: 1px dashed hsl(var(--border));

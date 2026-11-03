@@ -1294,6 +1294,7 @@ window.initGRPCForm = function(cfg) {
         state.schema = null;
         setInvokeEnabled(false);
         els.form.replaceChildren(h("div", {class: "form-skeleton", "aria-busy": "true"}, h("div"), h("div"), h("div")));
+        updateFormTools();
 
         const seq = ++state.loadSeq;
         api(metadataURI + "?method=" + encodeURIComponent(svc + "." + method))
@@ -1315,6 +1316,7 @@ window.initGRPCForm = function(cfg) {
                     console.trace(e);
                 }
                 els.form.replaceChildren(alertBox("destructive", "Couldn't load this method", e.message));
+                updateFormTools();
             });
     }
 
@@ -1805,6 +1807,7 @@ window.initGRPCForm = function(cfg) {
                 console.trace(e);
             }
             els.form.replaceChildren(alertBox("destructive", "Couldn't build the form", e.message || String(e)));
+            updateFormTools();
             state.schemaReady = true;
             setInvokeEnabled(true);
             return;
@@ -1867,7 +1870,9 @@ window.initGRPCForm = function(cfg) {
             validation = null;
         }
         state.request = newRequest;
+        refreshCollapsed(div);
         els.form.replaceChildren(div);
+        updateFormTools();
     }
 
     // Adds an input for the field described by fld. Handles everything but
@@ -1954,9 +1959,22 @@ window.initGRPCForm = function(cfg) {
         input.childKeys = [];
 
         const arrayVal = [];
+        // JSON object keys are always strings; give 32-bit int and bool keys
+        // their real type (64-bit ints stay strings, as in proto JSON)
+        const keyType = mapEntryFields[0].type;
+        const typedKey = function(k) {
+            switch (keyType) {
+                case "int32": case "sint32": case "sfixed32": case "uint32": case "fixed32":
+                    return isStringInt(k) ? Number(k) : k;
+                case "bool":
+                    return k === "true" ? true : k === "false" ? false : k;
+                default:
+                    return k;
+            }
+        };
         for (const k of Object.keys(value)) {
             const entry = {};
-            entry[mapEntryFields[0].name] = k;
+            entry[mapEntryFields[0].name] = typedKey(k);
             entry[mapEntryFields[1].name] = value[k];
             arrayVal.push(entry);
             input.childKeys.push(k);
@@ -1971,7 +1989,7 @@ window.initGRPCForm = function(cfg) {
                 // the key changed: make sure keys stay unique
                 const newKey = val;
                 for (let i = 0; i < this.childKeys.length; i++) {
-                    if (i !== index && this.childKeys[i] === newKey) {
+                    if (i !== index && !isUnset(this.childKeys[i]) && String(this.childKeys[i]) === String(newKey)) {
                         throw new Error('key "' + newKey + '" is a duplicate');
                     }
                 }
@@ -1981,6 +1999,10 @@ window.initGRPCForm = function(cfg) {
                     this.parent.onDelete(this, [key]);
                 }
                 this.childKeys[index] = newKey;
+                const entryRow = this.asArray.children[index] && this.asArray.children[index].row;
+                if (entryRow && entryRow._container) {
+                    movePaths(entryRow, mapEntryPath(pathOf(entryRow._container), newKey));
+                }
                 return;
             }
             if (isUnset(key)) {
@@ -2048,13 +2070,36 @@ window.initGRPCForm = function(cfg) {
             isRequired: false,
         };
 
-        for (let i = 0; i < value.length; i++) {
+        // items that hold a message can be collapsed on their own
+        const itemsCollapse = !fld.isMap && isContainerField(elementFld);
+        // List items are addressed by index (renumbered when one is removed).
+        // Map entries are addressed by key, so reordering keeps their state;
+        // a new entry gets a placeholder until its key is set.
+        const mapKeyName = fld.isMap ? schema.messageTypes[fld.type][0].name : null;
+        const newItemRow = function(index, entry) {
             const row = newArrayRow(input);
+            // read the parent's path now: it can change (map key rename, renumbering)
+            const basePath = pathOf(container);
+            row._container = container;
+            row._isMapEntry = !!fld.isMap;
+            if (fld.isMap) {
+                row.dataset.path = entry && !isUnset(entry[mapKeyName]) ? mapEntryPath(basePath, entry[mapKeyName]) : basePath + "{#" + (tempEntrySeq++) + "}";
+            } else {
+                row.dataset.path = basePath + "[" + index + "]";
+            }
             const cell = h("td", {class: "array-value"});
             row.appendChild(cell);
-            table.appendChild(row);
-            const child = addElementToForm(schema, cell, input, pathLen + 1, value[i], allowMissing, elementFld);
-            child.row = row;
+            if (itemsCollapse) {
+                makeCollapsible(row, "item");
+            }
+            return {row: row, cell: cell};
+        };
+
+        for (let i = 0; i < value.length; i++) {
+            const item = newItemRow(i, value[i]);
+            table.appendChild(item.row);
+            const child = addElementToForm(schema, item.cell, input, pathLen + 1, value[i], allowMissing, elementFld);
+            child.row = item.row;
             children.push(child);
         }
 
@@ -2064,14 +2109,16 @@ window.initGRPCForm = function(cfg) {
 
         addBtn.addEventListener("click", () => {
             const elementVal = getInitialValue(schema, elementFld);
-            const newRow = newArrayRow(input);
-            const cell = h("td", {class: "array-value"});
-            newRow.appendChild(cell);
+            const item = newItemRow(children.length, null);
+            const newRow = item.row;
             addRow.before(newRow);
-            const child = addElementToForm(schema, cell, input, pathLen + 1, elementVal, true, elementFld);
+            const child = addElementToForm(schema, item.cell, input, pathLen + 1, elementVal, true, elementFld);
             child.row = newRow;
             children.push(child);
             input.onAdd(child, [], elementVal);
+            // a new item starts open, even if an old item at this index was collapsed
+            [newRow].concat(qsa("tr.collapsible", newRow)).forEach(r => setCollapsed(r, false));
+            updateFormTools();
             if (fld.isMap) {
                 // the key likely needs editing right away so keys stay unique
                 const first = newRow.querySelector("input, textarea");
@@ -2091,7 +2138,16 @@ window.initGRPCForm = function(cfg) {
             const children = input.children;
             const idx = children.findIndex(c => c.row === row);
             forgetValidationIn(row);
+            const table = row.parentElement;
             row.remove();
+            forgetCollapsedUnder(row.dataset.path || "");
+            if (!row._isMapEntry && table && row._container) {
+                renumberItems(table, pathOf(row._container));
+            }
+            if (table) {
+                refreshCollapsed(table);
+            }
+            updateFormTools();
             if (idx < 0) {
                 return;
             }
@@ -2110,14 +2166,19 @@ window.initGRPCForm = function(cfg) {
         const fields = schema.messageTypes[fld.type];
         value = canonicalizeFields(value, fld.type, fields);
 
+        const basePath = pathOf(container);
         const table = makeTableContainer(container, pathLen);
         const children = {};
         const input = new Input(parent, children, value);
 
         for (const currField of fields) {
             const row = h("tr", {class: "message_field"});
+            row.dataset.path = basePath + "/" + currField.name;
             table.appendChild(row);
             row.appendChild(makeFieldLabelCell(currField, schema));
+            if (isContainerField(currField)) {
+                makeCollapsible(row, currField.protoName || currField.name, currField.isMap);
+            }
 
             if (isOneOf(currField)) {
                 const cell = h("td", {colspan: "2"});
@@ -2159,6 +2220,8 @@ window.initGRPCForm = function(cfg) {
             }
 
             const cell = h("td", {class: "field-value"});
+            // attach first: nested rows find their path through the row
+            row.appendChild(cell);
             if (isUnset(fldVal) && required) {
                 if (allowMissing) {
                     fldVal = getInitialValue(schema, currField);
@@ -2175,7 +2238,6 @@ window.initGRPCForm = function(cfg) {
             }
             child.fld = currField;
             children[currField.name] = child;
-            row.appendChild(cell);
 
             if (checkbox) {
                 const theField = currField;
@@ -2196,11 +2258,17 @@ window.initGRPCForm = function(cfg) {
                     }
                     input.onChange(newChild, [], newVal);
                     if (theBox.checked) {
+                        // show what was just switched on
+                        setCollapsed(row, false);
+                        refreshCollapsed(cell);
                         const first = cell.querySelector("input:not([type=checkbox]):not([type=radio]), textarea, select");
                         if (first && !first.disabled) {
                             first.focus();
                         }
+                    } else {
+                        refreshCollapsed(row);
                     }
+                    updateFormTools();
                 });
             }
         }
@@ -2271,8 +2339,12 @@ window.initGRPCForm = function(cfg) {
             }
 
             const row = h("tr", {class: "message_field"});
+            row.dataset.path = pathOf(container) + "/" + fld.name;
             table.appendChild(row);
             row.appendChild(makeFieldLabelCell(fld, schema));
+            if (isContainerField(fld)) {
+                makeCollapsible(row, fld.protoName || fld.name, fld.isMap);
+            }
 
             const radio = h("input", {type: "radio", name: radioName, value: fld.name, checked: isPresent, "aria-label": "Use " + (fld.protoName || fld.name)});
             if (isPresent) {
@@ -2309,11 +2381,18 @@ window.initGRPCForm = function(cfg) {
                     }
                 }
                 parent.onChange(newChild, [], newVal);
+                setCollapsed(row, false);
+                refreshCollapsed(div);
+                updateFormTools();
             });
         }
 
         const noneRadio = h("input", {type: "radio", name: radioName, value: "", checked: !foundValue, "aria-label": "None"});
-        noneRadio.addEventListener("change", clearPrevious);
+        noneRadio.addEventListener("change", () => {
+            clearPrevious();
+            refreshCollapsed(div);
+            updateFormTools();
+        });
         table.appendChild(h("tr", {class: "message_field"},
             h("td", {class: "oneof_none field-label", text: "None"}),
             h("td", {class: "oneof-radio"}, noneRadio),
@@ -2356,6 +2435,256 @@ window.initGRPCForm = function(cfg) {
     function isOneOf(fld) {
         return fld.type === "oneof" && !fld.isMessage;
     }
+
+    // ----- collapsible sections -----
+    //
+    // Fields that hold a message, list, map or oneof, and list items that
+    // hold a message, get a chevron. Collapsed rows hide their value and show
+    // a one-line summary instead. Each row has a data-path (like
+    // "/person/address" or "[2]/labels") so the collapsed state survives
+    // rebuilding the form, per method, for this page load.
+
+    const collapsedPaths = new Set();
+
+    function pathOf(el) {
+        const holder = el.closest("[data-path]");
+        return holder ? holder.dataset.path : "";
+    }
+
+    function collapseKey(row) {
+        return keyForPath(row.dataset.path);
+    }
+
+    function keyForPath(path) {
+        return state.service + "." + state.method + " " + path;
+    }
+
+    let tempEntrySeq = 0;
+
+    function mapEntryPath(basePath, key) {
+        return basePath + "{" + JSON.stringify(String(key)) + "}";
+    }
+
+    // True if path is prefix itself or something inside it.
+    function isUnderPath(path, prefix) {
+        if (path === prefix) {
+            return true;
+        }
+        if (!path.startsWith(prefix)) {
+            return false;
+        }
+        const next = path.charAt(prefix.length);
+        return next === "/" || next === "[" || next === "{";
+    }
+
+    function forgetCollapsedUnder(prefix) {
+        if (!prefix) {
+            return;
+        }
+        const keyPrefix = keyForPath("");
+        for (const key of Array.from(collapsedPaths)) {
+            if (key.startsWith(keyPrefix) && isUnderPath(key.slice(keyPrefix.length), prefix)) {
+                collapsedPaths.delete(key);
+            }
+        }
+    }
+
+    // Gives row (and every row inside it) the path newPrefix in place of its
+    // current one, carrying the collapsed state along.
+    function movePaths(row, newPrefix) {
+        const oldPrefix = row.dataset.path;
+        if (oldPrefix === undefined || oldPrefix === newPrefix) {
+            return;
+        }
+        const keyPrefix = keyForPath("");
+        const moved = [];
+        for (const key of Array.from(collapsedPaths)) {
+            if (key.startsWith(keyPrefix)) {
+                const path = key.slice(keyPrefix.length);
+                if (isUnderPath(path, oldPrefix)) {
+                    collapsedPaths.delete(key);
+                    moved.push(newPrefix + path.slice(oldPrefix.length));
+                }
+            }
+        }
+        moved.forEach(p => collapsedPaths.add(keyForPath(p)));
+        [row].concat(qsa("[data-path]", row)).forEach(el => {
+            if (isUnderPath(el.dataset.path, oldPrefix)) {
+                el.dataset.path = newPrefix + el.dataset.path.slice(oldPrefix.length);
+            }
+        });
+    }
+
+    // After a list item is removed, renumbers the remaining items 0..n-1.
+    function renumberItems(table, basePath) {
+        qsa(":scope > tr.array_element", table).forEach((r, i) => movePaths(r, basePath + "[" + i + "]"));
+    }
+
+    function isContainerField(f) {
+        if (f.isArray || f.isMap || isOneOf(f)) {
+            return true;
+        }
+        return !!f.isMessage && (!isWellKnown(f.type) || f.type === "google.protobuf.Any" || f.type === "google.protobuf.ListValue");
+    }
+
+    // label is the field name (or "item"). isMap picks "entries" wording.
+    function makeCollapsible(row, label, isMap) {
+        const isItem = row.classList.contains("array_element");
+        row.classList.add("collapsible");
+        row._label = label;
+        row._isMap = !!isMap;
+        const toggle = h("button", {type: "button", class: "collapse-toggle", "aria-expanded": "true"}, icon("chevron-down", 14));
+        const summary = h("button", {type: "button", class: isItem ? "item-summary" : "field-summary", tabindex: "-1", "aria-hidden": "true"});
+        row._toggle = toggle;
+        row._summary = summary;
+        if (isItem) {
+            qs(".array-actions", row).prepend(toggle);
+            qs(".array-value", row).appendChild(summary);
+        } else {
+            const labelCell = qs(".field-label", row);
+            labelCell.prepend(toggle);
+            labelCell.appendChild(summary);
+        }
+        toggle.addEventListener("click", e => {
+            const collapse = !row.classList.contains("collapsed");
+            setCollapsed(row, collapse);
+            if (e.altKey) {
+                // Alt-click applies to everything inside, too
+                qsa("tr.collapsible", row).forEach(r => setCollapsed(r, collapse));
+            }
+        });
+        summary.addEventListener("click", () => {
+            setCollapsed(row, false);
+            toggle.focus();
+        });
+        // restore the state from an earlier build of this form
+        applyCollapsed(row, collapsedPaths.has(collapseKey(row)));
+    }
+
+    function applyCollapsed(row, on) {
+        row.classList.toggle("collapsed", on);
+        const name = row._label === "item" ? "item" : row._label;
+        row._toggle.setAttribute("aria-expanded", on ? "false" : "true");
+        row._toggle.setAttribute("aria-label", (on ? "Expand " : "Collapse ") + name);
+        row._toggle.setAttribute("data-tooltip", on ? "Expand (Alt-click: everything inside)" : "Collapse (Alt-click: everything inside)");
+    }
+
+    // The element a collapsed row hides, or null if there's nothing to hide.
+    function collapseContent(row) {
+        let cell;
+        if (row.classList.contains("array_element")) {
+            cell = qs(":scope > .array-value", row);
+        } else {
+            cell = Array.from(row.children).find(td =>
+                !td.classList.contains("field-label") && !td.classList.contains("field-presence") && !td.classList.contains("oneof-radio"));
+        }
+        if (!cell) {
+            return null;
+        }
+        const content = Array.from(cell.children).find(c => !c.classList.contains("item-summary"));
+        if (!content || content.classList.contains("null")) {
+            return null;
+        }
+        return content;
+    }
+
+    function setCollapsed(row, on) {
+        if (!row.classList.contains("collapsible")) {
+            return;
+        }
+        if (on && !collapseContent(row)) {
+            on = false;
+        }
+        applyCollapsed(row, on);
+        if (on) {
+            collapsedPaths.add(collapseKey(row));
+            updateSummary(row);
+        } else {
+            collapsedPaths.delete(collapseKey(row));
+        }
+    }
+
+    // Brings collapsed rows under root up to date: rows with nothing to
+    // collapse open up, the rest get a fresh summary.
+    function refreshCollapsed(root) {
+        const rows = qsa("tr.collapsible", root);
+        if (root.matches && root.matches("tr.collapsible")) {
+            rows.unshift(root);
+        }
+        for (const row of rows) {
+            if (!row.classList.contains("collapsed")) {
+                continue;
+            }
+            if (collapseContent(row)) {
+                updateSummary(row);
+            } else {
+                applyCollapsed(row, false);
+            }
+        }
+    }
+
+    function updateSummary(row) {
+        const content = collapseContent(row);
+        let text = content ? summarize(content, row._isMap) : "";
+        if (row.classList.contains("array_element")) {
+            const index = qsa(":scope > tr.array_element", row.parentElement).indexOf(row);
+            text = "Item " + (index + 1) + (text ? " · " + text : "");
+        }
+        row._summary.textContent = text;
+    }
+
+    function summarize(content, isMap) {
+        if (content.classList.contains("oneof")) {
+            const radio = qs(":scope > table > tr > .oneof-radio > input:checked", content);
+            if (!radio || !radio.value) {
+                return "none set";
+            }
+            const name = qs(".field-name", radio.closest("tr"));
+            return (name ? name.textContent : radio.value) + " set";
+        }
+        if (!content.classList.contains("nest")) {
+            return "";
+        }
+        const table = content.firstElementChild;
+        if (table.classList.contains("array-table")) {
+            const n = qsa(":scope > tr.array_element", table).length;
+            return isMap ? (n === 1 ? "1 entry" : n + " entries") : plural(n, "item");
+        }
+        const anyType = qs(":scope > tr > td > input[list]", table);
+        if (anyType) {
+            return anyType.value.trim() || "Any";
+        }
+        const rows = qsa(":scope > tr.message_field", table);
+        let total = 0;
+        let set = 0;
+        for (const r of rows) {
+            const presence = qs(":scope > .field-presence", r);
+            if (!presence) {
+                continue;
+            }
+            total++;
+            const sw = qs(".switch", presence);
+            if (!sw || sw.checked) {
+                set++;
+            }
+        }
+        return total ? set + " of " + total + " set" : plural(rows.length, "field");
+    }
+
+    const formTools = qs("#gu-form-tools");
+
+    function updateFormTools() {
+        if (formTools) {
+            formTools.hidden = !qs("tr.collapsible", els.form);
+        }
+    }
+
+    function setAllCollapsed(on) {
+        qsa("tr.collapsible", els.form).forEach(r => setCollapsed(r, on));
+    }
+
+    qs("#gu-expand-all").addEventListener("click", () => setAllCollapsed(false));
+    qs("#gu-collapse-all").addEventListener("click", () => setAllCollapsed(true));
 
     function makeTableContainer(container, pathLen) {
         if (pathLen === 0) {
@@ -2897,9 +3226,10 @@ window.initGRPCForm = function(cfg) {
 
         const inp = h("input", {type: "text", class: "input input-sm mono", list: "grpc-message-types", spellcheck: "false", autocomplete: "off", "aria-label": "@type"});
         inp.value = typeName;
-        table.appendChild(h("tr", {class: "message_field"},
+        const typeRow = h("tr", {class: "message_field"},
             makeFieldLabelCell({name: "@type", protoName: "@type", type: ""}, schema),
-            h("td", {colspan: "2"}, inp)));
+            h("td", {colspan: "2"}, inp));
+        table.appendChild(typeRow);
 
         const updateVal = function(typeName, allowMissing) {
             const wellKnown = isWellKnown(typeName);
@@ -2945,11 +3275,13 @@ window.initGRPCForm = function(cfg) {
         };
 
         bindValidation(inp, () => {
-            // drop every row but the @type row
-            const rows = Array.from(table.rows);
-            for (let i = 1; i < rows.length; i++) {
-                forgetValidationIn(rows[i]);
-                rows[i].remove();
+            // drop the rows after @type (at the root, the table also has a header row before it)
+            let next = typeRow.nextElementSibling;
+            while (next) {
+                const after = next.nextElementSibling;
+                forgetValidationIn(next);
+                next.remove();
+                next = after;
             }
             for (const p of Object.keys(value)) {
                 delete value[p];
@@ -2960,6 +3292,8 @@ window.initGRPCForm = function(cfg) {
             }
             value["@type"] = "type.googleapis.com/" + newType;
             updateVal(newType, true);
+            refreshCollapsed(table);
+            updateFormTools();
             parent.onChange(input, [], value);
         });
 
@@ -3270,6 +3604,15 @@ window.initGRPCForm = function(cfg) {
         }
     }
 
+    // Opens any collapsed sections around el.
+    function revealField(el) {
+        let row = el.closest("tr.collapsed");
+        while (row) {
+            setCollapsed(row, false);
+            row = row.parentElement.closest("tr.collapsed");
+        }
+    }
+
     function focusInvalid(el) {
         el.scrollIntoView({block: "center", behavior: "smooth"});
         el.focus({preventScroll: true});
@@ -3283,8 +3626,10 @@ window.initGRPCForm = function(cfg) {
             toast("Fix the highlighted field first", {variant: "error", description: el.dataset.error});
             return false;
         }
-        const bad = qsa(".invalid-input", rootEl).find(el => el.getClientRects().length > 0);
+        const bad = qsa(".invalid-input", rootEl).find(el =>
+            el.getClientRects().length > 0 || (el.closest("tr.collapsed") && !el.closest("[hidden]")));
         if (bad) {
+            revealField(bad);
             focusInvalid(bad);
             toast("Fix the highlighted field first", {variant: "error", description: bad.dataset.error});
             return false;
@@ -3850,6 +4195,7 @@ window.initGRPCForm = function(cfg) {
         selectMethod(first.service, first.method);
     } else {
         renderMetadataSection();
+        updateFormTools();
         els.form.replaceChildren(h("div", {class: "gu-empty"}, icon("server", 28),
             h("p", {class: "gu-empty-title", text: "No methods to show"}),
             h("p", {class: "gu-empty-desc", text: "The server didn't report any services."})));
