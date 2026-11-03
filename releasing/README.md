@@ -6,14 +6,27 @@ The release process consists of a handful of tasks:
 1. Drop a release tag in git.
 2. Build binaries for various platforms. This is done using the local `go` tool and uses `GOOS` and `GOARCH` environment variables to cross-compile for supported platforms.
 3. Creates a release in GitHub, uploads the binaries, and generates the release notes (in the form of a change log).
-4. Build a docker image for the new release.
-5. Push the docker image to `ghcr.io`, with both a version tag and the "latest" tag.
 
 The [Homebrew](https://brew.sh/) recipe updates itself; see [Homebrew](#homebrew) below.
 
-All of this is automated by the **Release** GitHub Actions workflow (`.github/workflows/release.yml`). There is also a script in this same directory (`do-release.sh`) that does the same thing from a developer machine; see [Releasing from a laptop](#releasing-from-a-laptop) below.
+All of this is automated by the **Release** GitHub Actions workflow (`.github/workflows/release.yml`). There is also a script in this same directory (`do-release.sh`) that does the same thing from a developer machine (and also builds and pushes a Docker image); see [Releasing from a laptop](#releasing-from-a-laptop) below.
 
 ## Creating a new release
+
+There are two ways to start the workflow. Both run the tests, build the binaries and publish the GitHub release in the same way.
+
+### By pushing a tag
+
+Tag the commit to release with a version in sem-ver format, `v<Major>.<Minor>.<Patch>`, and push the tag:
+
+```sh
+git tag -a v2.3.4 -m "Release v2.3.4"
+git push origin v2.3.4
+```
+
+Pushing the tag starts the workflow. It releases exactly the tagged commit. It stops with an error if a GitHub release for that tag already exists. Tags that don't look like `vM.N.P` (for example `v2.3.4-rc1`) don't start a release.
+
+### By running the workflow
 
 Go to the [Release workflow](https://github.com/fullstorydev/grpcui/actions/workflows/release.yml), click **Run workflow**, and provide:
 
@@ -24,9 +37,8 @@ Go to the [Release workflow](https://github.com/fullstorydev/grpcui/actions/work
 The workflow then:
 1. Verifies the version is well-formed and that the tag does not already exist.
 2. Runs the tests.
-3. Creates and pushes the release tag.
+3. Creates and pushes the release tag. (A pushed tag skips this step.)
 4. Cross-compiles binaries for all supported platforms, creates the GitHub release with generated release notes, and uploads the archives. (This is goreleaser, driven by `.goreleaser.yml`.)
-5. Builds a multi-arch (`linux/amd64`, `linux/arm64`) Docker image and pushes it to `ghcr.io`, tagged with both the version and `latest`.
 
 That's the whole process — there is no manual follow-up. If things go wrong and you have to re-do part of it, see the sections below.
 
@@ -48,7 +60,6 @@ Since the notes come from the merged PRs, anything landed by pushing straight to
 | Secret | Used for | Required? |
 | --- | --- | --- |
 | `GITHUB_TOKEN` | Creating the tag and the GitHub release. | Provided automatically by Actions. |
-| _(none)_ | Pushing to `ghcr.io`. Uses the automatic `GITHUB_TOKEN` with `packages: write`. | n/a |
 
 There is nothing to configure: the workflow runs on the automatic token alone.
 
@@ -88,31 +99,6 @@ The `git tag ...` step is necessary because the release target requires that the
 This will create the release in GitHub, with notes generated from the PRs merged since the previous tag.
 
 Note that the notes come from the GitHub API, which resolves the tag name remotely. If the tag only exists locally, the API falls back to the default branch to pick the range, so notes generated this way can differ from what you'd get by pushing the tag first. The workflow always pushes the tag before this step.
-
-### Container Image Releases
-
-Images are published to the GitHub Container Registry as `ghcr.io/fullstorydev/grpcui`, with both a version tag and a `latest` tag.
-
-The workflow derives that name from the repository rather than hardcoding it, so a fork pushes to its own namespace and the workflow can be tested end to end without touching the real images.
-
-The first push to GHCR creates the package as **private**. Someone with admin on the org needs to visit the package settings once and change its visibility to public; after that, subsequent pushes keep the setting.
-
-To re-run only the image steps, we need to build an image with the right tags and then push:
-
-```sh
-# from the root of the repo
-echo v2.3.4 > VERSION
-docker build -t ghcr.io/fullstorydev/grpcui:v2.3.4 .
-# now that we have it built, push it
-docker push ghcr.io/fullstorydev/grpcui:v2.3.4
-# push "latest" tag, too
-docker tag ghcr.io/fullstorydev/grpcui:v2.3.4 ghcr.io/fullstorydev/grpcui:latest
-docker push ghcr.io/fullstorydev/grpcui:latest
-```
-
-Note this builds only for the host architecture; the workflow builds `linux/amd64` and `linux/arm64`. See `do-release.sh` for the `buildx` invocation that does a multi-arch build.
-
-If the `docker push ...` steps fail, you may need to run `docker login ghcr.io -u <your-username>`, using a GitHub personal access token with the `write:packages` scope as the password, and then try to push again.
 
 ### Homebrew
 
