@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine as builder
+FROM golang:1.26-alpine as builder
 MAINTAINER Fullstory Engineering
 
 # create non-privileged group and user
@@ -10,6 +10,7 @@ COPY VERSION *.go go.* /tmp/fullstorydev/grpcui/
 COPY cmd /tmp/fullstorydev/grpcui/cmd
 COPY internal /tmp/fullstorydev/grpcui/internal
 COPY standalone /tmp/fullstorydev/grpcui/standalone
+COPY storage /tmp/fullstorydev/grpcui/storage
 # and build a completely static binary (so we can use
 # scratch as basis for the final image)
 ENV CGO_ENABLED=0

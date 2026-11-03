@@ -66,9 +66,15 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 		handle(&mux, newResource(resourcePath, standalone.MustAsset(assetName), "", true))
 	}
 
-	// Add resources from WebFormPackage
-	handle(&mux, newResource("/grpc-web-form.js", grpcui.WebFormScript(), "text/javascript; charset=UTF-8", true))
-	handle(&mux, newResource("/grpc-web-form.css", uiOpts.css, "text/css; charset=UTF-8", uiOpts.cssPublic))
+	// Add resources from WebFormPackage. They must match the page's HTML, so
+	// browsers revalidate them (cheap, thanks to the ETag) instead of using a
+	// copy left over from an older grpcui version.
+	formJS := newResource("/grpc-web-form.js", grpcui.WebFormScript(), "text/javascript; charset=UTF-8", true)
+	formJS.MustRevalidate = true
+	handle(&mux, formJS)
+	formCSS := newResource("/grpc-web-form.css", uiOpts.css, "text/css; charset=UTF-8", uiOpts.cssPublic)
+	formCSS.MustRevalidate = true
+	handle(&mux, formCSS)
 
 	// Add optional resources to mux
 	for _, res := range uiOpts.addlServedResources() {
@@ -80,6 +86,9 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 		DefaultMetadata: uiOpts.defaultMetadata,
 		Debug:           uiOpts.debug,
 		GRPCurlOptions:  uiOpts.gRPCurlOptions,
+	}
+	if uiOpts.storage != nil {
+		formOpts.StorageURI = "api"
 	}
 	webFormHTML := grpcui.WebFormContentsWithOptions("invoke", "metadata", target, methods, formOpts)
 	indexContents := getIndexContents(uiOpts.indexTmpl, target, webFormHTML, uiOpts.tmplResources)
@@ -101,15 +110,22 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 	}
 	rpcInvokeHandler := http.StripPrefix("/invoke", grpcui.RPCInvokeHandlerWithOptions(ch, methods, invokeOpts))
 	mux.HandleFunc("/invoke/", func(w http.ResponseWriter, r *http.Request) {
-		// CSRF protection
-		c, _ := r.Cookie(csrfCookieName)
-		h := r.Header.Get(csrfHeaderName)
-		if c == nil || c.Value == "" || c.Value != h {
-			http.Error(w, "incorrect CSRF token", http.StatusUnauthorized)
+		if !checkCSRF(w, r) {
 			return
 		}
 		rpcInvokeHandler.ServeHTTP(w, r)
 	})
+
+	if uiOpts.storage != nil {
+		storageHandler := http.StripPrefix("/api", uiOpts.storage)
+		mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+			// reads need no CSRF protection; everything else changes data
+			if r.Method != http.MethodGet && r.Method != http.MethodHead && !checkCSRF(w, r) {
+				return
+			}
+			storageHandler.ServeHTTP(w, r)
+		})
+	}
 
 	rpcMetadataHandler := grpcui.RPCMetadataHandler(methods, files)
 	mux.Handle("/metadata", rpcMetadataHandler)
@@ -141,6 +157,18 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 
 		mux.ServeHTTP(w, r)
 	})
+}
+
+// checkCSRF verifies that the request's CSRF header matches its CSRF cookie.
+// If not, it writes an error and returns false.
+func checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	c, _ := r.Cookie(csrfCookieName)
+	h := r.Header.Get(csrfHeaderName)
+	if c == nil || c.Value == "" || c.Value != h {
+		http.Error(w, "incorrect CSRF token", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 var defaultIndexTemplate = template.Must(template.New("index.html").Parse(string(standalone.IndexTemplate())))

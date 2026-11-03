@@ -11,8 +11,16 @@
 // the CSS/styling of the page, instead use the various functions in the
 // "github.com/fullstorydev/grpcui" package to assemble your own web UI.
 //
-// Note that this package bundles the JS dependencies of the web form. It
-// provides jQuery 3.3.1 and jQuery-UI 1.12.1.
+// The web form has no third-party JS dependencies. The page adds the CSRF
+// token header to RPC invocations through the form's window.grpcui hook.
+//
+// By default the web form keeps its request history and saved requests in the
+// browser's local storage. With the WithStorage option, it keeps them through
+// a storage API that the handler serves under "/api/", normally the handler of
+// a SQLite database from the "github.com/fullstorydev/grpcui/storage" package
+// (this package does not import it, so programs that don't use it don't link
+// the SQLite driver). They then outlive the browser's data, and several
+// grpcui processes can share one database file.
 //
 // An example of using the package with a server supporting reflection:
 //
