@@ -66,9 +66,15 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 		handle(&mux, newResource(resourcePath, standalone.MustAsset(assetName), "", true))
 	}
 
-	// Add resources from WebFormPackage
-	handle(&mux, newResource("/grpc-web-form.js", grpcui.WebFormScript(), "text/javascript; charset=UTF-8", true))
-	handle(&mux, newResource("/grpc-web-form.css", uiOpts.css, "text/css; charset=UTF-8", uiOpts.cssPublic))
+	// Add resources from WebFormPackage. They must match the page's HTML, so
+	// browsers revalidate them (cheap, thanks to the ETag) instead of using a
+	// copy left over from an older grpcui version.
+	formJS := newResource("/grpc-web-form.js", grpcui.WebFormScript(), "text/javascript; charset=UTF-8", true)
+	formJS.MustRevalidate = true
+	handle(&mux, formJS)
+	formCSS := newResource("/grpc-web-form.css", uiOpts.css, "text/css; charset=UTF-8", uiOpts.cssPublic)
+	formCSS.MustRevalidate = true
+	handle(&mux, formCSS)
 
 	// Add optional resources to mux
 	for _, res := range uiOpts.addlServedResources() {

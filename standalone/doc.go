@@ -11,8 +11,8 @@
 // the CSS/styling of the page, instead use the various functions in the
 // "github.com/fullstorydev/grpcui" package to assemble your own web UI.
 //
-// Note that this package bundles the JS dependencies of the web form. It
-// provides jQuery 3.3.1 and jQuery-UI 1.12.1.
+// The web form has no third-party JS dependencies. The page adds the CSRF
+// token header to RPC invocations through the form's window.grpcui hook.
 //
 // An example of using the package with a server supporting reflection:
 //

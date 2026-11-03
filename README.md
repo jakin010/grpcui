@@ -28,8 +28,8 @@ This repo also provides two library packages
    a single, simple HTTP handler that provides the entire gRPC web UI. You can just wire this
    handler into your HTTP server to embed a gRPC web page that looks exactly like the one you
    see when you use the `grpcui` command-line program. This single handler uses the above
-   package but also supplies the enclosing HTML page, some other script dependencies (jQuery
-   and jQuery-UI), and additional CSS and image resources.
+   package but also supplies the enclosing HTML page, CSRF protection, and the favicon. The web
+   form itself is plain JavaScript and CSS with no third-party dependencies.
 
 ## Features
 `grpcui` supports all kinds of RPC methods, including streaming methods. However, it requires

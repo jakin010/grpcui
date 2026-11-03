@@ -2,7 +2,6 @@ package grpcui
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"os"
@@ -80,37 +79,20 @@ type WebFormOptions struct {
 // code into debug logging and can also be used to define the set of metadata to
 // show in the web form by default (empty if unspecified).
 func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, descs []*desc.MethodDescriptor, opts WebFormOptions) []byte {
-	type metadataEntry struct {
-		Name, Value string
+	cfg := webFormConfig{
+		InvokeURI:       invokeURI,
+		MetadataURI:     metadataURI,
+		Services:        []string{},
+		Methods:         map[string][]webFormMethod{},
+		SvcDescs:        map[string]string{},
+		MtdDescs:        map[string]string{},
+		DefaultMetadata: []webFormMetadata{},
+		Debug:           os.Getenv("GRPC_WEBFORM_DEBUG") != "",
+		Target:          target,
+		GRPCurlOptions:  strings.Join(opts.GRPCurlOptions, " "),
 	}
-	params := struct {
-		InvokeURI       string
-		MetadataURI     string
-		Services        []string
-		SvcDescs        map[string]string
-		Methods         map[string][]string
-		MtdDescs        map[string]string
-		DefaultMetadata []metadataEntry
-		Debug           bool
-		Target          string
-		GRPCurlOptions  template.JS
-	}{
-		InvokeURI:   invokeURI,
-		MetadataURI: metadataURI,
-		SvcDescs:    map[string]string{},
-		Methods:     map[string][]string{},
-		MtdDescs:    map[string]string{},
-		Debug:       os.Getenv("GRPC_WEBFORM_DEBUG") != "",
-		Target:      target,
-	}
-
-	gRPCOptionsJSONStr, err := json.Marshal(strings.Join(opts.GRPCurlOptions, " "))
-	if err != nil {
-		panic(fmt.Errorf("Error marshaling to JSON: %w", err))
-	}
-	params.GRPCurlOptions = template.JS(gRPCOptionsJSONStr)
 	if opts.Debug != nil {
-		params.Debug = *opts.Debug
+		cfg.Debug = *opts.Debug
 	}
 	for _, md := range opts.DefaultMetadata {
 		parts := strings.SplitN(md, ":", 2)
@@ -119,7 +101,7 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 		if len(parts) > 1 {
 			val = strings.TrimLeftFunc(parts[1], unicode.IsSpace)
 		}
-		params.DefaultMetadata = append(params.DefaultMetadata, metadataEntry{Name: key, Value: val})
+		cfg.DefaultMetadata = append(cfg.DefaultMetadata, webFormMetadata{Name: key, Value: val})
 	}
 
 	// build list of distinct service and method names and sort them
@@ -128,7 +110,11 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 		sd := md.GetService()
 		svcName := sd.GetFullyQualifiedName()
 		uniqueServices[svcName] = sd
-		params.Methods[svcName] = append(params.Methods[svcName], md.GetName())
+		cfg.Methods[svcName] = append(cfg.Methods[svcName], webFormMethod{
+			Name:         md.GetName(),
+			ClientStream: md.IsClientStreaming(),
+			ServerStream: md.IsServerStreaming(),
+		})
 
 		desc, err := protoPrinter.PrintProtoToString(md)
 		if err != nil {
@@ -140,20 +126,14 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 			if md.IsServerStreaming() {
 				respStr = "stream "
 			}
-			desc = fmt.Sprintf("   rpc %s (%s%s) returns (%s%s);", md.GetName(), reqStr, md.GetInputType().GetFullyQualifiedName(), respStr, md.GetOutputType().GetFullyQualifiedName())
+			desc = fmt.Sprintf("rpc %s (%s%s) returns (%s%s);", md.GetName(), reqStr, md.GetInputType().GetFullyQualifiedName(), respStr, md.GetOutputType().GetFullyQualifiedName())
 		} else {
-			// indent and remove trailing newline
 			desc = strings.TrimSuffix(desc, "\n")
-			parts := strings.Split(desc, "\n")
-			for i := range parts {
-				parts[i] = "   " + parts[i]
-			}
-			desc = strings.Join(parts, "\n")
 		}
-		params.MtdDescs[md.GetFullyQualifiedName()] = desc
+		cfg.MtdDescs[md.GetFullyQualifiedName()] = desc
 	}
 	for svcName, sd := range uniqueServices {
-		params.Services = append(params.Services, svcName)
+		cfg.Services = append(cfg.Services, svcName)
 		// for the service description, omit the methods (we just want the
 		//  service's comments and options)
 		sb, err := builder.FromService(sd)
@@ -176,14 +156,21 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 			}
 			desc = strings.TrimSuffix(desc, tr)
 		}
-		params.SvcDescs[sd.GetFullyQualifiedName()] = desc
+		cfg.SvcDescs[sd.GetFullyQualifiedName()] = desc
 	}
-	sort.Strings(params.Services)
-	for _, methods := range params.Methods {
-		sort.Strings(methods)
+	sort.Strings(cfg.Services)
+	for _, methods := range cfg.Methods {
+		sort.Slice(methods, func(i, j int) bool { return methods[i].Name < methods[j].Name })
 	}
 
-	// render the template
+	// render the template; html/template encodes Config as JSON in the script
+	params := struct {
+		Target string
+		Config webFormConfig
+	}{
+		Target: target,
+		Config: cfg,
+	}
 	var formBuf bytes.Buffer
 	if err := webFormTemplate.Execute(&formBuf, params); err != nil {
 		panic(err)
@@ -191,18 +178,51 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 	return formBuf.Bytes()
 }
 
+// webFormConfig is passed to the web form's initGRPCForm function as JSON.
+type webFormConfig struct {
+	InvokeURI       string                     `json:"invokeURI"`
+	MetadataURI     string                     `json:"metadataURI"`
+	Services        []string                   `json:"services"`
+	Methods         map[string][]webFormMethod `json:"methods"`
+	SvcDescs        map[string]string          `json:"svcDescs"`
+	MtdDescs        map[string]string          `json:"mtdDescs"`
+	DefaultMetadata []webFormMetadata          `json:"defaultMetadata"`
+	Debug           bool                       `json:"debug"`
+	Target          string                     `json:"target"`
+	GRPCurlOptions  string                     `json:"grpcurlOptions"`
+}
+
+type webFormMethod struct {
+	Name         string `json:"name"`
+	ClientStream bool   `json:"clientStream"`
+	ServerStream bool   `json:"serverStream"`
+}
+
+type webFormMetadata struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 // WebFormScript returns the JavaScript that powers the web form returned by
 // WebFormContents.
 //
-// The returned JavaScript requires that jQuery and jQuery UI libraries already
-// be loaded in the container HTML page. It includes JavaScript code that relies
-// on the "$" symbol.
+// The script is plain JavaScript with no dependencies. It defines a global
+// initGRPCForm function, which the HTML from WebFormContents calls.
+//
+// The form fills the height of the page (100vh), with a sidebar of services,
+// the request and the response side by side. It is meant to be the main
+// content of the page.
 //
 // Note that the script, by default, does not handle CSRF protection. To add
-// that, the enclosing page, in which the script is embedded, can use jQuery to
-// configure this. For example, you can use the $.ajaxSend() jQuery function to
-// intercept RPC invocations and automatically add a CSRF token header. To then
-// check the token on the server-side, you will need to create a wrapper handler
+// that, the enclosing page can define a hook that returns extra headers for
+// every request the form makes, before the script runs:
+//
+//	window.grpcui = {
+//	  requestHeaders: function(req) { return {"x-csrf-token": token}; }
+//	};
+//
+// The hook gets an object with the request's url and method. To then check
+// the token on the server-side, you will need to create a wrapper handler
 // that first verifies the CSRF token header before delegating to a
 // RPCInvokeHandler.
 func WebFormScript() []byte {
