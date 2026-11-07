@@ -2230,3 +2230,234 @@
         transition-duration: 0.01ms !important;
     }
 }
+
+/* ---------- passkey flows ---------- */
+
+.grpcui .dialog.dialog-wide {
+    width: min(760px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
+}
+
+.grpcui .alert-success {
+    border-color: hsl(var(--success) / 0.45);
+    color: hsl(var(--success));
+}
+
+.grpcui .pk-heading {
+    margin: 4px 0 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: hsl(var(--muted-foreground));
+}
+
+.grpcui .pk-heading:not(:first-child) {
+    margin-top: 20px;
+}
+
+.grpcui .saved-item.pk-item {
+    padding-left: 8px;
+}
+
+.grpcui .pk-site {
+    margin: 10px 0 2px 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: hsl(var(--muted-foreground));
+}
+
+.grpcui .pk-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: flex-end;
+}
+
+.grpcui .pk-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px;
+    border: 1px solid hsl(var(--border));
+    border-radius: var(--radius);
+}
+
+.grpcui .pk-section-head {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+}
+
+.grpcui .pk-num {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.grpcui .pk-section-title {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.grpcui .pk-map {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.grpcui .pk-map-row {
+    display: grid;
+    grid-template-columns: minmax(150px, 2fr) 3fr;
+    gap: 10px;
+    align-items: start;
+    padding: 6px 0;
+    border-top: 1px solid hsl(var(--border) / 0.7);
+}
+
+.grpcui .pk-map-label {
+    font-size: 12.5px;
+    overflow-wrap: anywhere;
+}
+
+.grpcui .pk-map-label .required {
+    margin-left: 3px;
+    color: hsl(var(--destructive-text));
+}
+
+.grpcui .pk-map-src {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+}
+
+.grpcui .pk-map-src > .select:first-child {
+    flex: 1 1 220px;
+    min-width: 0;
+}
+
+.grpcui .pk-map-src > .input {
+    flex: 1 1 160px;
+    min-width: 0;
+}
+
+.grpcui .pk-map-src > .pk-enc {
+    flex: none;
+    width: auto;
+}
+
+.grpcui .pk-json {
+    min-height: 0;
+    font-size: 12px;
+}
+
+.grpcui .pk-preview {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.grpcui .pk-preview-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.grpcui .pk-preview .code {
+    max-height: 260px;
+    overflow: auto;
+}
+
+.grpcui .pk-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 18px 0 14px;
+    padding: 0;
+    list-style: none;
+}
+
+.grpcui .pk-step {
+    display: flex;
+    gap: 10px;
+    padding: 10px 0;
+    border-top: 1px solid hsl(var(--border) / 0.7);
+}
+
+.grpcui .pk-step-icon {
+    display: inline-flex;
+    flex: none;
+    padding-top: 1px;
+    color: hsl(var(--muted-foreground));
+}
+
+.grpcui .pk-step[data-state="done"] .pk-step-icon {
+    color: hsl(var(--success));
+}
+
+.grpcui .pk-step[data-state="failed"] .pk-step-icon {
+    color: hsl(var(--destructive-text));
+}
+
+.grpcui .pk-step[data-state="running"] .pk-step-icon {
+    color: hsl(var(--foreground));
+}
+
+.grpcui .pk-step-main {
+    flex: 1;
+    min-width: 0;
+}
+
+.grpcui .pk-step-title {
+    font-size: 13.5px;
+    font-weight: 500;
+}
+
+.grpcui .pk-step[data-state="pending"] .pk-step-title {
+    color: hsl(var(--muted-foreground));
+}
+
+.grpcui .pk-step-detail {
+    margin-top: 2px;
+    overflow-wrap: anywhere;
+}
+
+.grpcui .pk-step[data-state="failed"] .pk-step-detail {
+    color: hsl(var(--destructive-text));
+}
+
+.grpcui .pk-step-json details {
+    margin-top: 6px;
+}
+
+.grpcui .pk-step-json summary {
+    font-size: 12.5px;
+    color: hsl(var(--muted-foreground));
+    cursor: pointer;
+}
+
+.grpcui .pk-step-json .code {
+    max-height: 240px;
+    margin-top: 6px;
+    overflow: auto;
+}
+
+.grpcui .pk-offer {
+    flex-wrap: wrap;
+}
+
+@media (max-width: 560px) {
+    .grpcui .pk-map-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
+    }
+}
