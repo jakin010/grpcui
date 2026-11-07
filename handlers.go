@@ -75,6 +75,15 @@ type InvokeOptions struct {
 // accepts an additional argument, options. This can be used to add extra
 // request metadata to all RPCs invoked.
 func RPCInvokeHandlerWithOptions(ch grpc.ClientConnInterface, descs []*desc.MethodDescriptor, options InvokeOptions) http.Handler {
+	return DynamicRPCInvokeHandler(ch, func() []*desc.MethodDescriptor { return descs }, options)
+}
+
+// DynamicRPCInvokeHandler is the same as RPCInvokeHandlerWithOptions except
+// that it calls methods on each request for the methods it may invoke, so the
+// set can change while the handler is in use (for example, when the schema is
+// reloaded from the server). Live calls that are running keep going when it
+// changes.
+func DynamicRPCInvokeHandler(ch grpc.ClientConnInterface, methods func() []*desc.MethodDescriptor, options InvokeOptions) http.Handler {
 	live := newLiveCalls()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -94,16 +103,22 @@ func RPCInvokeHandlerWithOptions(ch grpc.ClientConnInterface, descs []*desc.Meth
 			method = method[1:]
 		}
 
-		for _, md := range descs {
+		if op != "" && op != "open" {
+			// acts on a running live call, which knows its own method
+			live.serveOp(w, r, op, method)
+			return
+		}
+
+		for _, md := range methods() {
 			if md.GetFullyQualifiedName() == method {
 				descSource, err := grpcurl.DescriptorSourceFromFileDescriptors(md.GetFile())
 				if err != nil {
 					http.Error(w, "Failed to create descriptor source: "+err.Error(), http.StatusInternalServerError)
 					return
 				}
-				if op != "" {
+				if op == "open" {
 					// a live call (see streams.go)
-					live.serve(w, r, op, md, ch, descSource, &options)
+					live.open(w, r, md, ch, descSource, &options)
 					return
 				}
 				results, err := invokeRPC(r.Context(), method, ch, descSource, r.Header, r.Body, &options)
@@ -173,6 +188,8 @@ func RPCMetadataHandler(methods []*desc.MethodDescriptor, files []*desc.FileDesc
 		}
 
 		w.Header().Set("Content-Type", "application/json")
+		// the schema can change when it's reloaded
+		w.Header().Set("Cache-Control", "no-store")
 		enc := json.NewEncoder(w)
 
 		enc.SetIndent("", "  ")

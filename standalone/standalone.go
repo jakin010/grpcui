@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic/grpcdynamic"
@@ -90,17 +92,64 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 	if uiOpts.storage != nil {
 		formOpts.StorageURI = "api"
 	}
-	webFormHTML := grpcui.WebFormContentsWithOptions("invoke", "metadata", target, methods, formOpts)
-	indexContents := getIndexContents(uiOpts.indexTmpl, target, webFormHTML, uiOpts.tmplResources)
-	indexResource := newResource("/", indexContents, "text/html; charset=utf-8", false)
-	indexResource.MustRevalidate = true
+	if uiOpts.reloadSchema != nil {
+		formOpts.ReloadURI = "reload"
+	}
+
+	// Everything that depends on the schema, swapped as a whole when the
+	// schema is reloaded.
+	type schemaState struct {
+		methods  []*desc.MethodDescriptor
+		index    *resource
+		metadata http.Handler
+	}
+	newSchemaState := func(methods []*desc.MethodDescriptor, files []*desc.FileDescriptor) *schemaState {
+		webFormHTML := grpcui.WebFormContentsWithOptions("invoke", "metadata", target, methods, formOpts)
+		indexContents := getIndexContents(uiOpts.indexTmpl, target, webFormHTML, uiOpts.tmplResources)
+		index := newResource("/", indexContents, "text/html; charset=utf-8", false)
+		index.MustRevalidate = true
+		return &schemaState{
+			methods:  methods,
+			index:    index,
+			metadata: grpcui.RPCMetadataHandler(methods, files),
+		}
+	}
+	var current atomic.Pointer[schemaState]
+	current.Store(newSchemaState(methods, files))
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			indexResource.ServeHTTP(w, r)
+			current.Load().index.ServeHTTP(w, r)
 		} else {
 			http.NotFound(w, r)
 		}
 	})
+
+	if uiOpts.reloadSchema != nil {
+		var reloadMu sync.Mutex
+		mux.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if !checkCSRF(w, r) {
+				return
+			}
+			// one at a time, so a slow reload can't replace a newer one
+			reloadMu.Lock()
+			defer reloadMu.Unlock()
+			methods, files, err := uiOpts.reloadSchema(r.Context())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			current.Store(newSchemaState(methods, files))
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write(grpcui.WebFormSchema(methods))
+		})
+	}
 
 	invokeOpts := grpcui.InvokeOptions{
 		ExtraMetadata:   uiOpts.extraMetadata,
@@ -108,7 +157,8 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 		EmitDefaults:    uiOpts.emitDefaults,
 		Verbosity:       uiOpts.invokeVerbosity,
 	}
-	rpcInvokeHandler := http.StripPrefix("/invoke", grpcui.RPCInvokeHandlerWithOptions(ch, methods, invokeOpts))
+	currentMethods := func() []*desc.MethodDescriptor { return current.Load().methods }
+	rpcInvokeHandler := http.StripPrefix("/invoke", grpcui.DynamicRPCInvokeHandler(ch, currentMethods, invokeOpts))
 	mux.HandleFunc("/invoke/", func(w http.ResponseWriter, r *http.Request) {
 		if !checkCSRF(w, r) {
 			return
@@ -127,8 +177,9 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 		})
 	}
 
-	rpcMetadataHandler := grpcui.RPCMetadataHandler(methods, files)
-	mux.Handle("/metadata", rpcMetadataHandler)
+	mux.HandleFunc("/metadata", func(w http.ResponseWriter, r *http.Request) {
+		current.Load().metadata.ServeHTTP(w, r)
+	})
 
 	mux.HandleFunc("/examples", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "application/json")
@@ -336,5 +387,18 @@ func HandlerViaReflection(ctx context.Context, cc grpc.ClientConnInterface, targ
 		return nil, err
 	}
 
+	// reload the same way (an option given by the caller takes precedence)
+	reload := WithSchemaReloader(func(ctx context.Context) ([]*desc.MethodDescriptor, []*desc.FileDescriptor, error) {
+		m, err := grpcui.AllMethodsViaReflection(ctx, cc)
+		if err != nil {
+			return nil, nil, err
+		}
+		f, err := grpcui.AllFilesViaReflection(ctx, cc)
+		if err != nil {
+			return nil, nil, err
+		}
+		return m, f, nil
+	})
+	opts = append([]HandlerOption{reload}, opts...)
 	return Handler(cc, target, m, f, opts...), nil
 }

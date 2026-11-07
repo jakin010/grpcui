@@ -596,35 +596,48 @@ func main() {
 		fail(err, "Failed to dial target host %q", target)
 	}
 
-	var descSource grpcurl.DescriptorSource
-	var refClient *grpcreflect.Client
-	var fileSource grpcurl.DescriptorSource
-	if len(protoset) > 0 {
-		var err error
-		fileSource, err = grpcurl.DescriptorSourceFromProtoSets(protoset...)
+	// loadSchema finds the methods to expose and all known files. It runs at
+	// start up, and again whenever the web UI asks to reload the schema (so
+	// it re-reads proto and protoset files, and asks the server again).
+	loadSchema := func(ctx context.Context) ([]*desc.MethodDescriptor, []*desc.FileDescriptor, error) {
+		var fileSource grpcurl.DescriptorSource
+		if len(protoset) > 0 {
+			var err error
+			fileSource, err = grpcurl.DescriptorSourceFromProtoSets(protoset...)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to process proto descriptor sets: %w", err)
+			}
+		} else if len(protoFiles) > 0 {
+			var err error
+			fileSource, err = grpcurl.DescriptorSourceFromProtoFiles(importPaths, protoFiles...)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to process proto source files: %w", err)
+			}
+		}
+		descSource := fileSource
+		if reflection.val {
+			md := grpcurl.MetadataFromHeaders(append(addlHeaders, reflHeaders...))
+			refCtx := metadata.NewOutgoingContext(ctx, md)
+			refClient := grpcreflect.NewClientAuto(refCtx, cc)
+			refClient.AllowMissingFileDescriptors()
+			// done with the reflection stream once everything is loaded
+			defer refClient.Reset()
+			reflSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
+			if fileSource != nil {
+				descSource = compositeSource{reflSource, fileSource}
+			} else {
+				descSource = reflSource
+			}
+		}
+		methods, err := getMethods(descSource, configs)
 		if err != nil {
-			fail(err, "Failed to process proto descriptor sets.")
+			return nil, nil, fmt.Errorf("failed to compute set of methods to expose: %w", err)
 		}
-	} else if len(protoFiles) > 0 {
-		var err error
-		fileSource, err = grpcurl.DescriptorSourceFromProtoFiles(importPaths, protoFiles...)
+		allFiles, err := grpcurl.GetAllFiles(descSource)
 		if err != nil {
-			fail(err, "Failed to process proto source files.")
+			return nil, nil, fmt.Errorf("failed to enumerate all proto files: %w", err)
 		}
-	}
-	if reflection.val {
-		md := grpcurl.MetadataFromHeaders(append(addlHeaders, reflHeaders...))
-		refCtx := metadata.NewOutgoingContext(ctx, md)
-		refClient = grpcreflect.NewClientAuto(refCtx, cc)
-		refClient.AllowMissingFileDescriptors()
-		reflSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
-		if fileSource != nil {
-			descSource = compositeSource{reflSource, fileSource}
-		} else {
-			descSource = reflSource
-		}
-	} else {
-		descSource = fileSource
+		return methods, allFiles, nil
 	}
 
 	// arrange for the RPCs (and the database) to be cleanly shutdown
@@ -633,10 +646,6 @@ func main() {
 		if store != nil {
 			_ = store.Close()
 			store = nil
-		}
-		if refClient != nil {
-			refClient.Reset()
-			refClient = nil
 		}
 		if cc != nil {
 			cc.Close()
@@ -650,22 +659,12 @@ func main() {
 		os.Exit(code)
 	}
 
-	methods, err := getMethods(descSource, configs)
+	methods, allFiles, err := loadSchema(ctx)
 	if err != nil {
-		fail(err, "Failed to compute set of methods to expose")
-	}
-	allFiles, err := grpcurl.GetAllFiles(descSource)
-	if err != nil {
-		fail(err, "Failed to enumerate all proto files")
+		fail(err, "Failed to load the RPC schema")
 	}
 
-	// can go ahead and close reflection client now
-	if refClient != nil {
-		refClient.Reset()
-		refClient = nil
-	}
-
-	var handlerOpts []standalone.HandlerOption
+	handlerOpts := []standalone.HandlerOption{standalone.WithSchemaReloader(loadSchema)}
 	if len(defHeaders) > 0 {
 		handlerOpts = append(handlerOpts, standalone.WithDefaultMetadata(defHeaders))
 	}

@@ -2,6 +2,7 @@ package grpcui
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"os"
@@ -76,6 +77,9 @@ type WebFormOptions struct {
 	// API at this URI (see the storage package); otherwise it keeps them in
 	// the browser's local storage.
 	StorageURI string
+	// If set, the form shows a button that reloads the schema by POSTing to
+	// this URI, which must respond with WebFormSchema for the new methods.
+	ReloadURI string
 }
 
 // WebFormContentsWithOptions is the same as WebFormContents except that it
@@ -86,15 +90,12 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 	cfg := webFormConfig{
 		InvokeURI:       invokeURI,
 		MetadataURI:     metadataURI,
-		Services:        []string{},
-		Methods:         map[string][]webFormMethod{},
-		SvcDescs:        map[string]string{},
-		MtdDescs:        map[string]string{},
 		DefaultMetadata: []webFormMetadata{},
 		Debug:           os.Getenv("GRPC_WEBFORM_DEBUG") != "",
 		Target:          target,
 		GRPCurlOptions:  strings.Join(opts.GRPCurlOptions, " "),
 		StorageURI:      opts.StorageURI,
+		ReloadURI:       opts.ReloadURI,
 	}
 	if opts.Debug != nil {
 		cfg.Debug = *opts.Debug
@@ -107,6 +108,43 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 			val = strings.TrimLeftFunc(parts[1], unicode.IsSpace)
 		}
 		cfg.DefaultMetadata = append(cfg.DefaultMetadata, webFormMetadata{Name: key, Value: val})
+	}
+
+	cfg.webFormSchema = newWebFormSchema(descs)
+
+	// render the template; html/template encodes Config as JSON in the script
+	params := struct {
+		Target string
+		Config webFormConfig
+	}{
+		Target: target,
+		Config: cfg,
+	}
+	var formBuf bytes.Buffer
+	if err := webFormTemplate.Execute(&formBuf, params); err != nil {
+		panic(err)
+	}
+	return formBuf.Bytes()
+}
+
+// WebFormSchema returns, as JSON, the part of the web form's configuration
+// that describes the given methods: their services, names, and definitions.
+// A handler for WebFormOptions.ReloadURI responds with it, so the form can
+// show the reloaded schema without reloading the page.
+func WebFormSchema(descs []*desc.MethodDescriptor) []byte {
+	b, err := json.Marshal(newWebFormSchema(descs))
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func newWebFormSchema(descs []*desc.MethodDescriptor) webFormSchema {
+	cfg := webFormSchema{
+		Services: []string{},
+		Methods:  map[string][]webFormMethod{},
+		SvcDescs: map[string]string{},
+		MtdDescs: map[string]string{},
 	}
 
 	// build list of distinct service and method names and sort them
@@ -167,35 +205,28 @@ func WebFormContentsWithOptions(invokeURI, metadataURI string, target string, de
 	for _, methods := range cfg.Methods {
 		sort.Slice(methods, func(i, j int) bool { return methods[i].Name < methods[j].Name })
 	}
-
-	// render the template; html/template encodes Config as JSON in the script
-	params := struct {
-		Target string
-		Config webFormConfig
-	}{
-		Target: target,
-		Config: cfg,
-	}
-	var formBuf bytes.Buffer
-	if err := webFormTemplate.Execute(&formBuf, params); err != nil {
-		panic(err)
-	}
-	return formBuf.Bytes()
+	return cfg
 }
 
 // webFormConfig is passed to the web form's initGRPCForm function as JSON.
 type webFormConfig struct {
-	InvokeURI       string                     `json:"invokeURI"`
-	MetadataURI     string                     `json:"metadataURI"`
-	Services        []string                   `json:"services"`
-	Methods         map[string][]webFormMethod `json:"methods"`
-	SvcDescs        map[string]string          `json:"svcDescs"`
-	MtdDescs        map[string]string          `json:"mtdDescs"`
-	DefaultMetadata []webFormMetadata          `json:"defaultMetadata"`
-	Debug           bool                       `json:"debug"`
-	Target          string                     `json:"target"`
-	GRPCurlOptions  string                     `json:"grpcurlOptions"`
-	StorageURI      string                     `json:"storageURI"`
+	webFormSchema
+	InvokeURI       string            `json:"invokeURI"`
+	MetadataURI     string            `json:"metadataURI"`
+	ReloadURI       string            `json:"reloadURI,omitempty"`
+	DefaultMetadata []webFormMetadata `json:"defaultMetadata"`
+	Debug           bool              `json:"debug"`
+	Target          string            `json:"target"`
+	GRPCurlOptions  string            `json:"grpcurlOptions"`
+	StorageURI      string            `json:"storageURI"`
+}
+
+// webFormSchema describes the methods the web form offers.
+type webFormSchema struct {
+	Services []string                   `json:"services"`
+	Methods  map[string][]webFormMethod `json:"methods"`
+	SvcDescs map[string]string          `json:"svcDescs"`
+	MtdDescs map[string]string          `json:"mtdDescs"`
 }
 
 type webFormMethod struct {
