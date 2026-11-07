@@ -252,6 +252,33 @@ loopback IP, which keeps other websites from reaching it through DNS rebinding. 
 through a reverse proxy or a port forward under another host name, allow that name with
 `-allow-host`, for example `-allow-host grpcui.local`.
 
+### Passkey Flows
+grpcui can test a server's passkey (WebAuthn) RPCs. A passkey ceremony is usually two
+calls: a "begin" RPC returns a challenge, and a "finish" RPC takes what the passkey
+returned. A *passkey flow* maps the begin response's fields to the options a passkey
+needs (challenge, relying party, user, allowed credentials) and the passkey's result to
+the finish request's fields (credential ID, client data, attestation or signature, and
+values such as a session ID carried over from the begin response).
+
+When a response holds a passkey challenge, the response panel offers *Make a passkey
+flow*. grpcui guesses the mapping from field names and shows the options it would build,
+for you to check. It handles servers that send each value as its own field and servers
+that send the whole options object, or take the whole credential, as one JSON string.
+Running a flow calls begin, creates or signs with a passkey, and calls finish, showing
+each step's JSON. The key button in the top bar lists flows and passkeys.
+
+Passkeys come from one of two places:
+- **grpcui's passkeys** (the default) are made by a built-in virtual authenticator. They
+  work for any relying party ID and origin, so you can test staging or production-like
+  servers. Their private keys are kept in grpcui's database (see `-db`), so treat them as
+  test credentials. A new passkey is kept only if the finish RPC succeeds.
+- **This device's passkeys** (Touch ID, a security key) use the browser. Browsers only
+  allow them for the page's own host, so they work only when the server's relying party
+  ID is `localhost` and grpcui is opened at `http://localhost:<port>`.
+
+Passkey flows need grpcui's database. To try them, run the test server in
+`testing/cmd/testsvr`, which has demo `PasskeyDemo` and `PasskeyDemoJSON` services.
+
 ## Descriptor Sources
 The `grpcui` tool can operate on a variety of sources for descriptors. The descriptors
 are required, in order for `grpcui` to understand the RPC schema, translate inputs

@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+// A demo relying party (a server that signs users in with passkeys), for
+// trying grpcui's passkey flows. Each ceremony is two calls: Begin returns
+// the options a passkey needs, and Finish takes what the passkey returned.
+// Users and passkeys are kept in memory until the server stops.
+package passkeydemo;
+
+// Field by field: every value is its own proto field.
+service PasskeyDemo {
+  // Starts creating a passkey for a user. The user is created if needed.
+  rpc BeginRegistration(BeginRegistrationRequest) returns (BeginRegistrationResponse);
+  // Checks the new passkey and adds it to the user.
+  rpc FinishRegistration(FinishRegistrationRequest) returns (FinishRegistrationResponse);
+  // Starts signing in. Leave user_name empty to let the passkey pick the user.
+  rpc BeginLogin(BeginLoginRequest) returns (BeginLoginResponse);
+  // Checks the passkey's signature and signs the user in.
+  rpc FinishLogin(FinishLoginRequest) returns (FinishLoginResponse);
+}
+
+// Whole objects: the options and the credential are JSON strings, as many
+// servers built on WebAuthn libraries send them.
+service PasskeyDemoJSON {
+  rpc BeginRegistration(BeginRegistrationRequest) returns (OptionsJSON);
+  rpc FinishRegistration(CredentialJSON) returns (FinishRegistrationResponse);
+  rpc BeginLogin(BeginLoginRequest) returns (OptionsJSON);
+  rpc FinishLogin(CredentialJSON) returns (FinishLoginResponse);
+}
+
+message BeginRegistrationRequest {
+  string user_name = 1;
+  // Defaults to user_name.
+  string display_name = 2;
+}
+
+message BeginRegistrationResponse {
+  bytes challenge = 1;
+  string rp_id = 2;
+  string rp_name = 3;
+  bytes user_id = 4;
+  string user_name = 5;
+  string display_name = 6;
+  // The user's passkeys, so the same authenticator doesn't make a second one.
+  repeated bytes existing_credential_ids = 7;
+  // Pass this back to FinishRegistration.
+  string session_id = 8;
+}
+
+message FinishRegistrationRequest {
+  string session_id = 1;
+  bytes credential_id = 2;
+  bytes client_data_json = 3;
+  bytes attestation_object = 4;
+  repeated string transports = 5;
+}
+
+message FinishRegistrationResponse {
+  string user_name = 1;
+  bytes credential_id = 2;
+  int32 passkey_count = 3;
+}
+
+message BeginLoginRequest {
+  // Empty for a discoverable login, where the passkey says who the user is.
+  string user_name = 1;
+}
+
+message BeginLoginResponse {
+  bytes challenge = 1;
+  string rp_id = 2;
+  // Empty for a discoverable login.
+  repeated bytes credential_ids = 3;
+  // Pass this back to FinishLogin.
+  string session_id = 4;
+}
+
+message FinishLoginRequest {
+  string session_id = 1;
+  bytes credential_id = 2;
+  bytes client_data_json = 3;
+  bytes authenticator_data = 4;
+  bytes signature = 5;
+  bytes user_handle = 6;
+}
+
+message FinishLoginResponse {
+  string user_name = 1;
+  uint32 sign_count = 2;
+  string message = 3;
+}
+
+message OptionsJSON {
+  string session_id = 1;
+  // PublicKeyCredentialCreationOptionsJSON or ...RequestOptionsJSON.
+  string options = 2;
+}
+
+message CredentialJSON {
+  string session_id = 1;
+  // The credential as JSON (what PublicKeyCredential.toJSON() returns).
+  string credential = 2;
+}

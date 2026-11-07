@@ -8,7 +8,7 @@
  *   1. Helpers and small UI pieces (icons, tabs, tooltip, toast, dialog,
  *      sheet, menu, JSON highlighting)
  *   2. initGRPCForm: sidebar, metadata scopes, request form, invoke,
- *      response, history, examples
+ *      response, history, saved requests, passkey flows, examples
  */
 (function() {
 "use strict";
@@ -52,6 +52,7 @@ const ICONS = {
     "dot": '<circle cx="12" cy="12" r="1"/>',
     "bookmark": '<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>',
     "pencil": '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
+    "key": '<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>',
 };
 
 function icon(name, size, cls) {
@@ -466,7 +467,7 @@ function confirmDialog(opts) {
 }
 
 // A modal dialog with a form. opts: {title, description, body (nodes),
-// submitLabel, onReady({submit, error}), onSubmit: async () => false to stay
+// submitLabel, className, onReady({submit, error}), onSubmit: async () => false to stay
 // open; throwing shows the error in the dialog}. Resolves true if submitted.
 function openFormDialog(opts) {
     return new Promise(resolve => {
@@ -480,7 +481,7 @@ function openFormDialog(opts) {
             h("div", {class: "dialog-fields"}, opts.body),
             error,
             h("div", {class: "dialog-actions"}, cancel, submit));
-        const dlg = h("dialog", {class: "dialog", "aria-label": opts.title}, form);
+        const dlg = h("dialog", {class: "dialog" + (opts.className ? " " + opts.className : ""), "aria-label": opts.title}, form);
         let result = false;
         cancel.addEventListener("click", () => dlg.close());
         form.addEventListener("submit", async e => {
@@ -3867,6 +3868,7 @@ window.initGRPCForm = function(cfg) {
         const original = state.request;
         const data = Array.isArray(original) ? original : [original];
         const metadata = effectiveMetadata().map(m => ({name: m.name, value: m.value}));
+        const snapshot = currentRequestSnapshot().request;
 
         const historyItem = {
             request: {
@@ -3893,6 +3895,7 @@ window.initGRPCForm = function(cfg) {
             });
             const ms = performance.now() - start;
             renderResponse(resp || {}, ms, methodInfo(service, method));
+            offerPasskeyFlow(service, method, snapshot, resp);
             addHistory(Object.assign(historyItem, {durationMS: ms, responseData: historyResponseData(resp || {})}));
         } catch (e) {
             const ms = performance.now() - start;
@@ -5063,6 +5066,1462 @@ window.initGRPCForm = function(cfg) {
     // one after the other, so that only one of them decides whether the
     // database is reachable
     loadHistory().then(reloadSaved);
+
+    // ---------------------------------------------------------------------
+    // Passkey flows
+    //
+    // A flow runs a passkey ceremony against the server. It calls a "begin"
+    // RPC, builds WebAuthn options from fields of its response, has a passkey
+    // create a credential (registration) or sign the challenge (login), then
+    // calls a "finish" RPC with fields filled in from the result.
+    //
+    // Passkeys come from grpcui's virtual authenticator, which works for any
+    // site and keeps its keys in grpcui's database, or from this browser
+    // (Touch ID, a security key), which only works for this page's own host.
+    // Flows and passkeys need grpcui's database.
+    // ---------------------------------------------------------------------
+
+    const passkeysBtn = qs("#gu-passkeys-btn");
+    let flows = [];
+    let passkeys = [];
+    let passkeyView = null; // set while the Passkeys sheet is open
+    const schemaCache = new Map();
+
+    function passkeysAvailable() {
+        return !!storageURI && useRemote;
+    }
+
+    // What a passkey needs, per kind of flow. names are normalized field
+    // names (see norm) used to guess the mapping.
+    const OPTION_FIELDS = {
+        register: [
+            {key: "challenge", label: "challenge", binary: true, required: true, names: ["challenge"]},
+            {key: "rp.id", label: "rp.id", names: ["rpid", "relyingpartyid"], hint: "Defaults to the origin's host"},
+            {key: "rp.name", label: "rp.name", names: ["rpname", "relyingpartyname"], hint: "Defaults to rp.id"},
+            {key: "user.id", label: "user.id", binary: true, required: true, names: ["userid", "userhandle"]},
+            {key: "user.name", label: "user.name", required: true, names: ["username", "name", "email", "login"]},
+            {key: "user.displayName", label: "user.displayName", names: ["displayname", "userdisplayname"], hint: "Defaults to user.name"},
+            {key: "excludeCredentials", label: "excludeCredentials[].id", binary: true, list: true,
+                names: ["excludecredentials", "excludecredentialids", "existingcredentialids", "excludedcredentials", "existingcredentials", "credentialids"]},
+        ],
+        login: [
+            {key: "challenge", label: "challenge", binary: true, required: true, names: ["challenge"]},
+            {key: "rpId", label: "rpId", names: ["rpid", "relyingpartyid"], hint: "Defaults to the origin's host"},
+            {key: "allowCredentials", label: "allowCredentials[].id", binary: true, list: true,
+                names: ["allowcredentials", "allowedcredentials", "allowcredentialids", "allowedcredentialids", "credentialids"],
+                hint: "Empty lets any passkey for the site answer"},
+        ],
+    };
+    const WHOLE_NAMES = ["options", "optionsjson", "publickey", "creationoptions", "requestoptions", "publickeyoptions",
+        "credentialcreationoptions", "credentialrequestoptions", "webauthnoptions", "challengeoptions"];
+
+    // What a passkey returns, per kind of flow.
+    const CREDENTIAL_PARTS = {
+        register: [
+            {key: "id", label: "credential ID", binary: true, names: ["credentialid", "id", "rawid", "credid"]},
+            {key: "response.clientDataJSON", label: "clientDataJSON", binary: true, names: ["clientdatajson", "clientdata"]},
+            {key: "response.attestationObject", label: "attestationObject", binary: true, names: ["attestationobject", "attestation"]},
+            {key: "response.authenticatorData", label: "authenticatorData", binary: true, names: ["authenticatordata", "authdata"]},
+            {key: "response.transports", label: "transports", list: true, names: ["transports"]},
+            {key: "response.publicKey", label: "publicKey", binary: true, names: ["publickey"]},
+            {key: "response.publicKeyAlgorithm", label: "publicKeyAlgorithm", names: ["publickeyalgorithm", "algorithm", "alg"]},
+            {key: "$json", label: "whole credential (JSON)", names: ["credential", "credentialjson", "response", "responsejson",
+                "registrationresponse", "attestationresponse", "publickeycredential"]},
+        ],
+        login: [
+            {key: "id", label: "credential ID", binary: true, names: ["credentialid", "id", "rawid", "credid"]},
+            {key: "response.clientDataJSON", label: "clientDataJSON", binary: true, names: ["clientdatajson", "clientdata"]},
+            {key: "response.authenticatorData", label: "authenticatorData", binary: true, names: ["authenticatordata", "authdata"]},
+            {key: "response.signature", label: "signature", binary: true, names: ["signature", "sig"]},
+            {key: "response.userHandle", label: "userHandle", binary: true, names: ["userhandle"]},
+            {key: "$json", label: "whole credential (JSON)", names: ["credential", "credentialjson", "response", "responsejson",
+                "assertion", "assertionresponse", "authenticationresponse", "publickeycredential"]},
+        ],
+    };
+
+    const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const lastSeg = p => p.slice(p.lastIndexOf(".") + 1);
+    const flowKindLabel = k => k === "register" ? "Create passkey" : "Sign in";
+
+    // ----- binary values -----
+
+    function b64ToBytes(s) {
+        s = String(s).trim().replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+        while (s.length % 4) {
+            s += "=";
+        }
+        const bin = atob(s);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) {
+            out[i] = bin.charCodeAt(i);
+        }
+        return out;
+    }
+
+    function bytesToB64(b) {
+        b = new Uint8Array(b);
+        let s = "";
+        for (let i = 0; i < b.length; i++) {
+            s += String.fromCharCode(b[i]);
+        }
+        return btoa(s);
+    }
+
+    function bytesToB64url(b) {
+        return bytesToB64(b).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    const B64_RE = /^[A-Za-z0-9+/_-]+={0,2}$/;
+
+    // Turns a field value into a WebAuthn binary value (base64url). enc is
+    // "auto", "base64", "text" or "hex"; auto reads bytes fields as bytes and
+    // string fields as base64url (the WebAuthn convention), falling back to
+    // the text's UTF-8 bytes.
+    function toBinary(value, enc, fieldType) {
+        if (typeof value !== "string") {
+            throw new Error("expected text, got " + describeType(value));
+        }
+        enc = enc || "auto";
+        if (enc === "text") {
+            return bytesToB64url(new TextEncoder().encode(value));
+        }
+        if (enc === "hex") {
+            const hex = value.replace(/\s+/g, "");
+            if (!/^([0-9a-fA-F]{2})*$/.test(hex)) {
+                throw new Error("not hex");
+            }
+            return bytesToB64url(new Uint8Array(hex.match(/../g) ? hex.match(/../g).map(x => parseInt(x, 16)) : []));
+        }
+        if (enc === "base64" || fieldType === "bytes") {
+            try {
+                return bytesToB64url(b64ToBytes(value));
+            } catch (e) {
+                throw new Error("not base64");
+            }
+        }
+        if (B64_RE.test(value)) {
+            try {
+                return bytesToB64url(b64ToBytes(value));
+            } catch (e) {
+                // not base64 after all: use the text
+            }
+        }
+        return bytesToB64url(new TextEncoder().encode(value));
+    }
+
+    function shortID(b64) {
+        return b64 && b64.length > 14 ? b64.slice(0, 6) + "…" + b64.slice(-6) : (b64 || "");
+    }
+
+    // ----- schemas and paths -----
+
+    function methodSchema(svc, method) {
+        const k = svc + "." + method;
+        if (!schemaCache.has(k)) {
+            schemaCache.set(k, api(metadataURI + "?method=" + encodeURIComponent(k)).catch(e => {
+                schemaCache.delete(k);
+                throw e;
+            }));
+        }
+        return schemaCache.get(k);
+    }
+
+    // Message types shown as one value rather than as their fields.
+    const LEAF_MESSAGES = new Set([
+        "google.protobuf.Struct", "google.protobuf.Value", "google.protobuf.ListValue", "google.protobuf.Any",
+        "google.protobuf.Timestamp", "google.protobuf.Duration", "google.protobuf.FieldMask",
+        "google.protobuf.StringValue", "google.protobuf.BytesValue", "google.protobuf.BoolValue",
+        "google.protobuf.Int32Value", "google.protobuf.Int64Value", "google.protobuf.UInt32Value",
+        "google.protobuf.UInt64Value", "google.protobuf.DoubleValue", "google.protobuf.FloatValue",
+    ]);
+    const WRAPPED = {"google.protobuf.StringValue": "string", "google.protobuf.BytesValue": "bytes"};
+
+    // The fields of a message type, nested messages flattened into dotted
+    // paths: [{path, type, isArray}]. Responses use proto names (grpcui
+    // writes them that way); requests use JSON names, like the form.
+    function schemaLeaves(schema, type, protoNames) {
+        const out = [];
+        if (!schema || !type) {
+            return out;
+        }
+        const walk = (t, prefix, depth, seen) => {
+            const visit = f => {
+                const name = protoNames ? (f.protoName || f.name) : f.name;
+                const path = prefix ? prefix + "." + name : name;
+                if (f.isMessage && !f.isArray && !f.isMap && !LEAF_MESSAGES.has(f.type) && depth < 4 && !seen.has(f.type)) {
+                    walk(f.type, path, depth + 1, new Set(seen).add(f.type));
+                } else if (!f.isMap) {
+                    out.push({path: path, type: WRAPPED[f.type] || f.type, isArray: !!f.isArray});
+                }
+            };
+            for (const f of (schema.messageTypes || {})[t] || []) {
+                if (isOneOf(f)) {
+                    (f.oneOfFields || []).forEach(visit);
+                } else {
+                    visit(f);
+                }
+            }
+        };
+        walk(type, "", 0, new Set([type]));
+        return out;
+    }
+
+    function leafLabel(l) {
+        const t = l.type.startsWith("google.protobuf.") ? l.type.slice(16) : l.type.slice(l.type.lastIndexOf(".") + 1);
+        return l.path + "  ·  " + t + (l.isArray ? "[]" : "");
+    }
+
+    function getPath(obj, path) {
+        let v = obj;
+        for (const p of path.split(".")) {
+            if (v === null || typeof v !== "object") {
+                return undefined;
+            }
+            v = v[p];
+        }
+        return v;
+    }
+
+    function setPath(obj, path, value) {
+        const parts = path.split(".");
+        let o = obj;
+        for (let i = 0; i < parts.length - 1; i++) {
+            if (o[parts[i]] === null || typeof o[parts[i]] !== "object" || Array.isArray(o[parts[i]])) {
+                o[parts[i]] = {};
+            }
+            o = o[parts[i]];
+        }
+        o[parts[parts.length - 1]] = value;
+    }
+
+    // Finds the leaf that best matches one of the names: a whole-path match
+    // first, then a last-segment match; shallower paths win.
+    function matchLeaf(leaves, names, filter) {
+        let best = null;
+        let bestScore = Infinity;
+        leaves.forEach(l => {
+            if (filter && !filter(l)) {
+                return;
+            }
+            const whole = norm(l.path);
+            const last = norm(lastSeg(l.path));
+            names.forEach((n, i) => {
+                const score = whole === n ? i : last === n ? 100 + i : Infinity;
+                const s = score + l.path.split(".").length / 10;
+                if (s < bestScore) {
+                    bestScore = s;
+                    best = l;
+                }
+            });
+        });
+        return best;
+    }
+
+    // ----- building the options and the finish request -----
+
+    function flowOrigin(f) {
+        return f.authenticator === "device" ? window.location.origin : (f.origin || "https://localhost");
+    }
+
+    function originHost(origin) {
+        try {
+            return new URL(origin).hostname;
+        } catch (e) {
+            return "";
+        }
+    }
+
+    // Reads a source: {from: "response", path} or {from: "value", value}.
+    function readSource(src, msg) {
+        return src.from === "value" ? src.value : getPath(msg, src.path);
+    }
+
+    // Builds the WebAuthn options from the begin response message.
+    // leaves maps response paths to their schema leaves.
+    function buildOptions(kind, f, msg, leaves) {
+        const problems = [];
+        const map = f.map || {};
+        let opts = {};
+        const whole = map.$whole;
+        if (whole && whole.from) {
+            let v = readSource(whole, msg);
+            if (typeof v === "string") {
+                try {
+                    v = JSON.parse(v);
+                } catch (e) {
+                    problems.push("whole options: " + (whole.path || "the value") + " isn't JSON (" + e.message + ")");
+                    v = null;
+                }
+            }
+            if (v && typeof v === "object" && v.publicKey && typeof v.publicKey === "object") {
+                v = v.publicKey; // a CredentialCreationOptions wrapper
+            }
+            if (v && typeof v === "object" && !Array.isArray(v)) {
+                opts = JSON.parse(JSON.stringify(v));
+            } else if (v !== null && v !== undefined) {
+                problems.push("whole options: " + (whole.path || "the value") + " isn't a JSON object");
+            } else if (whole.from === "response") {
+                problems.push("whole options: the response has no " + whole.path);
+            }
+        }
+        for (const def of OPTION_FIELDS[kind]) {
+            const src = map[def.key];
+            if (!src || !src.from) {
+                continue;
+            }
+            let v = readSource(src, msg);
+            if (isUnset(v) || v === "" || (Array.isArray(v) && v.length === 0 && !def.list)) {
+                if (src.from === "response" && def.required) {
+                    problems.push(def.label + ": the response has no " + src.path);
+                }
+                if (!def.list) {
+                    continue;
+                }
+                v = [];
+            }
+            const leaf = src.from === "response" ? leaves.get(src.path) : null;
+            const type = leaf ? leaf.type : "string";
+            try {
+                if (def.list) {
+                    if (typeof v === "string") {
+                        try {
+                            v = JSON.parse(v);
+                        } catch (e) {
+                            v = [v];
+                        }
+                    }
+                    if (!Array.isArray(v)) {
+                        v = [v];
+                    }
+                    v = v.map(x => ({type: "public-key", id: toBinary(x && typeof x === "object" ? x.id : x, src.enc, type)}));
+                } else if (def.binary) {
+                    v = toBinary(v, src.enc, type);
+                } else {
+                    v = String(v);
+                }
+            } catch (e) {
+                problems.push(def.label + ": " + e.message);
+                continue;
+            }
+            setPath(opts, def.key, v);
+        }
+
+        const host = originHost(flowOrigin(f));
+        if (kind === "register") {
+            opts.rp = opts.rp && typeof opts.rp === "object" ? opts.rp : {};
+            opts.rp.id = opts.rp.id || host;
+            opts.rp.name = opts.rp.name || opts.rp.id;
+            opts.user = opts.user && typeof opts.user === "object" ? opts.user : {};
+            if (!opts.user.displayName && opts.user.name) {
+                opts.user.displayName = opts.user.name;
+            }
+            if (!Array.isArray(opts.pubKeyCredParams) || !opts.pubKeyCredParams.length) {
+                opts.pubKeyCredParams = [{type: "public-key", alg: -7}, {type: "public-key", alg: -257}];
+            }
+            opts.authenticatorSelection = opts.authenticatorSelection || {residentKey: "required", userVerification: "preferred"};
+            opts.attestation = opts.attestation || "none";
+            if (!opts.user.id) {
+                problems.push("user.id is required");
+            }
+            if (!opts.user.name) {
+                problems.push("user.name is required");
+            }
+        } else {
+            opts.rpId = opts.rpId || host;
+            opts.userVerification = opts.userVerification || "preferred";
+        }
+        if (!opts.challenge) {
+            problems.push("challenge is required");
+        }
+        return {options: opts, problems: Array.from(new Set(problems))};
+    }
+
+    function partDef(kind, key) {
+        return CREDENTIAL_PARTS[kind].find(p => p.key === key);
+    }
+
+    // Builds the finish request: the flow's request body with mapped fields
+    // filled in. leaves maps request paths to their schema leaves.
+    function buildFinishRequest(kind, f, beginMsg, credential, leaves) {
+        const data = JSON.parse(JSON.stringify(isUnset(f.finish.request && f.finish.request.data) ? {} : f.finish.request.data));
+        const problems = [];
+        for (const [path, src] of Object.entries(f.result || {})) {
+            if (!src || !src.from) {
+                continue;
+            }
+            const leaf = leaves.get(path);
+            let v;
+            if (src.from === "credential") {
+                v = src.key === "$json" ? JSON.stringify(credential) : getPath(credential, src.key);
+                if (isUnset(v)) {
+                    problems.push(path + ": the passkey returned no " + src.key);
+                    continue;
+                }
+                const part = partDef(kind, src.key);
+                if (part && part.binary && leaf && leaf.type === "bytes" && typeof v === "string") {
+                    v = bytesToB64(b64ToBytes(v));
+                }
+            } else {
+                v = readSource(src, beginMsg);
+                if (isUnset(v)) {
+                    if (src.from === "response") {
+                        problems.push(path + ": the begin response has no " + src.path);
+                    }
+                    continue;
+                }
+            }
+            if (leaf && leaf.isArray && !Array.isArray(v)) {
+                v = [v];
+            }
+            setPath(data, path, v);
+        }
+        return {data: data, problems: problems};
+    }
+
+    // Guesses the mappings from field names, keeping ones already made.
+    function guessMappings(kind, f, beginLeaves, finishLeaves, sample) {
+        f.map = f.map || {};
+        f.result = f.result || {};
+        if (!f.map.$whole) {
+            const strs = beginLeaves.filter(l => !l.isArray && (l.type === "string" || l.type === "google.protobuf.Struct"));
+            let whole = matchLeaf(strs, WHOLE_NAMES);
+            if (!whole && sample) {
+                whole = strs.find(l => {
+                    const v = getPath(sample, l.path);
+                    return typeof v === "string" && /"challenge"\s*:/.test(v);
+                }) || null;
+            }
+            if (whole) {
+                f.map.$whole = {from: "response", path: whole.path};
+            }
+        }
+        if (!f.map.$whole) {
+            for (const def of OPTION_FIELDS[kind]) {
+                if (f.map[def.key]) {
+                    continue;
+                }
+                const l = matchLeaf(beginLeaves, def.names, x => !!def.list === x.isArray);
+                if (l) {
+                    f.map[def.key] = {from: "response", path: l.path, enc: "auto"};
+                }
+            }
+        }
+        const used = new Set(Object.keys(f.result));
+        const credUsed = new Set(Object.values(f.result).filter(s => s && s.from === "credential").map(s => s.key));
+        for (const part of CREDENTIAL_PARTS[kind]) {
+            if (credUsed.has(part.key)) {
+                continue;
+            }
+            const l = matchLeaf(finishLeaves, part.names, x => !used.has(x.path) && !!part.list === x.isArray &&
+                (part.key !== "$json" || x.type === "string"));
+            if (l) {
+                f.result[l.path] = {from: "credential", key: part.key};
+                used.add(l.path);
+            }
+        }
+        // carry values such as a session ID over from the begin response
+        for (const l of finishLeaves) {
+            if (used.has(l.path)) {
+                continue;
+            }
+            const same = beginLeaves.find(b => norm(lastSeg(b.path)) === norm(lastSeg(l.path)) && b.isArray === l.isArray);
+            if (same) {
+                f.result[l.path] = {from: "response", path: same.path};
+                used.add(l.path);
+            }
+        }
+    }
+
+    // Guesses whether a method begins a registration or a login.
+    function guessKind(method, sample) {
+        if (/regist|enrol|signup|create|attest/i.test(method)) {
+            return "register";
+        }
+        if (/login|signin|logon|auth|assert/i.test(method)) {
+            return "login";
+        }
+        const text = JSON.stringify(sample || {});
+        return /user_?id|pubKeyCredParams|excludeCredentials|"user"/i.test(text) ? "register" : "login";
+    }
+
+    // Guesses the finish method for a begin method.
+    function guessFinish(svc, method) {
+        const names = (services[svc] || []).map(m => m.name).filter(n => n !== method);
+        const rest = method.replace(/^(Begin|Start|Init|Initiate|Request|Get|Create|Generate)/, "");
+        const finishRe = /^(Finish|Complete|Verify|End|Validate|Confirm|Submit)/;
+        return names.find(n => finishRe.test(n) && n.replace(finishRe, "") === rest) ||
+            names.find(n => finishRe.test(n) && n.toLowerCase().includes(rest.toLowerCase())) ||
+            names.find(n => /finish/i.test(n)) || "";
+    }
+
+    function looksLikePasskeyOptions(msg) {
+        let found = false;
+        const walk = (v, depth) => {
+            if (found || depth > 4 || v === null) {
+                return;
+            }
+            if (typeof v === "string") {
+                found = v.length < 100000 && /^\s*\{/.test(v) && /"challenge"\s*:/.test(v);
+            } else if (typeof v === "object") {
+                for (const [k, x] of Object.entries(v)) {
+                    if (norm(k).includes("challenge")) {
+                        found = true;
+                        return;
+                    }
+                    walk(x, depth + 1);
+                }
+            }
+        };
+        walk(msg, 0);
+        return found;
+    }
+
+    // ----- calling the RPCs -----
+
+    // Calls one of a flow's RPCs with the given request body, sending the
+    // method's inherited metadata plus the flow's own headers. Adds the call
+    // to history. Returns {message} or {error}.
+    async function callFlowRPC(call, data) {
+        const req = call.request || {};
+        const own = (req.metadata || []).map(m => ({name: m.name, value: m.value, enabled: true}));
+        const metadata = flattenMetadata(resolveMetadata(chainFor(call.service, call.method).concat([{key: "request", rows: own}])))
+            .map(m => ({name: m.name, value: m.value}));
+        const historyItem = {
+            request: {timeout_seconds: req.timeout_secs, metadata: metadata, data: JSON.parse(JSON.stringify(data))},
+            ownMetadata: (req.metadata || []).slice(),
+            service: call.service,
+            method: call.method,
+            startTime: new Date().toISOString(),
+        };
+        const start = performance.now();
+        let resp;
+        try {
+            resp = (await api(invokeURI + "/" + call.service + "." + call.method, {
+                method: "POST",
+                body: {timeout_seconds: req.timeout_secs || 0, metadata: metadata, data: [data]},
+            })) || {};
+        } catch (e) {
+            addHistory(Object.assign(historyItem, {durationMS: performance.now() - start, failureStatus: e.status ? "HTTP " + e.status : "network error"}));
+            return {error: e.message, raw: null};
+        }
+        addHistory(Object.assign(historyItem, {durationMS: performance.now() - start, responseData: historyResponseData(resp)}));
+        if (resp.error) {
+            return {error: resp.error.name + ": " + resp.error.message, raw: resp};
+        }
+        const msgs = (resp.responses || []).filter(m => !m.isError);
+        if (!msgs.length) {
+            return {error: "The server sent no response message.", raw: resp};
+        }
+        return {message: msgs[0].message, raw: resp};
+    }
+
+    // ----- device passkeys (navigator.credentials) -----
+
+    // Says why this browser can't use a device passkey for rpId, or "".
+    function deviceProblem(rpId) {
+        const host = window.location.hostname;
+        if (!window.PublicKeyCredential || !navigator.credentials) {
+            return "This browser doesn't support passkeys.";
+        }
+        if (/^[\d.]+$/.test(host) || host.includes(":")) {
+            return "Browsers don't allow passkeys on an IP address. Open grpcui at " + window.location.protocol + "//localhost" +
+                (window.location.port ? ":" + window.location.port : "") + " instead.";
+        }
+        if (rpId && rpId !== host && !host.endsWith("." + rpId)) {
+            return "A device passkey for " + rpId + " only works on that site, and this page is on " + host +
+                ". Use grpcui's passkeys instead, or have the server use " + host + " as its relying party ID.";
+        }
+        return "";
+    }
+
+    function credentialToJSON(cred) {
+        if (typeof cred.toJSON === "function") {
+            try {
+                return cred.toJSON();
+            } catch (e) {
+                // build it by hand below
+            }
+        }
+        const r = cred.response;
+        const out = {
+            id: cred.id,
+            rawId: bytesToB64url(cred.rawId),
+            type: cred.type,
+            response: {clientDataJSON: bytesToB64url(r.clientDataJSON)},
+            clientExtensionResults: typeof cred.getClientExtensionResults === "function" ? cred.getClientExtensionResults() : {},
+        };
+        if (cred.authenticatorAttachment) {
+            out.authenticatorAttachment = cred.authenticatorAttachment;
+        }
+        if (r.attestationObject) {
+            out.response.attestationObject = bytesToB64url(r.attestationObject);
+            if (typeof r.getTransports === "function") {
+                out.response.transports = r.getTransports();
+            }
+            if (typeof r.getAuthenticatorData === "function") {
+                out.response.authenticatorData = bytesToB64url(r.getAuthenticatorData());
+            }
+            if (typeof r.getPublicKey === "function" && r.getPublicKey()) {
+                out.response.publicKey = bytesToB64url(r.getPublicKey());
+            }
+            if (typeof r.getPublicKeyAlgorithm === "function") {
+                out.response.publicKeyAlgorithm = r.getPublicKeyAlgorithm();
+            }
+        } else {
+            out.response.authenticatorData = bytesToB64url(r.authenticatorData);
+            out.response.signature = bytesToB64url(r.signature);
+            if (r.userHandle && r.userHandle.byteLength) {
+                out.response.userHandle = bytesToB64url(r.userHandle);
+            }
+        }
+        return out;
+    }
+
+    async function deviceCreate(options) {
+        const o = JSON.parse(JSON.stringify(options));
+        o.challenge = b64ToBytes(o.challenge);
+        o.user.id = b64ToBytes(o.user.id);
+        (o.excludeCredentials || []).forEach(d => d.id = b64ToBytes(d.id));
+        delete o.hints;
+        return credentialToJSON(await navigator.credentials.create({publicKey: o}));
+    }
+
+    async function deviceGet(options) {
+        const o = JSON.parse(JSON.stringify(options));
+        o.challenge = b64ToBytes(o.challenge);
+        (o.allowCredentials || []).forEach(d => d.id = b64ToBytes(d.id));
+        delete o.hints;
+        return credentialToJSON(await navigator.credentials.get({publicKey: o}));
+    }
+
+    // ----- loading -----
+
+    async function reloadPasskeys() {
+        if (!passkeysAvailable()) {
+            return;
+        }
+        const [f, p] = await Promise.all([storageAPI("/flows"), storageAPI("/passkeys")]);
+        flows = (f && f.items) || [];
+        passkeys = (p && p.items) || [];
+        if (passkeyView) {
+            renderPasskeySheet();
+        }
+    }
+
+    const flowStore = {
+        save(item) {
+            const body = {name: item.name, kind: item.kind, flow: item.flow};
+            return item.id
+                ? storageAPI("/flows/" + encodeURIComponent(item.id), {method: "PUT", body: body})
+                : storageAPI("/flows", {method: "POST", body: body});
+        },
+        remove(id) {
+            return storageAPI("/flows/" + encodeURIComponent(id), {method: "DELETE"});
+        },
+    };
+
+    // ----- running a flow -----
+
+    // Asks which of several passkeys should sign. Resolves to one or null.
+    function choosePasskey(cands) {
+        let chosen = cands[0];
+        const radios = cands.map((p, i) => {
+            const r = h("input", {type: "radio", name: "gu-pk-choice", checked: i === 0});
+            r.addEventListener("change", () => chosen = p);
+            return h("label", {class: "dlg-choice"}, r, h("span", null, p.userName || "(no name)", " ",
+                h("span", {class: "muted mono", text: shortID(p.credentialId)}),
+                p.lastUsedAt ? h("span", {class: "muted", text: " · used " + formatTime(p.lastUsedAt)}) : null));
+        });
+        return openFormDialog({
+            title: "Which passkey should sign in?",
+            description: plural(cands.length, "passkey") + " for " + cands[0].rpId + " can answer this challenge.",
+            body: [h("div", {class: "dlg-choices", role: "radiogroup"}, radios)],
+            submitLabel: "Sign in",
+            onSubmit: () => true,
+        }).then(ok => ok ? chosen : null);
+    }
+
+    function stepRow(title) {
+        const status = h("span", {class: "pk-step-icon"}, icon("dot", 16));
+        const detail = h("div", {class: "pk-step-detail muted text-sm"});
+        const body = h("div", {class: "pk-step-json"});
+        const row = h("li", {class: "pk-step"},
+            status,
+            h("div", {class: "pk-step-main"}, h("div", {class: "pk-step-title", text: title}), detail, body));
+        return {
+            el: row,
+            set(state, text, json, jsonLabel) {
+                row.dataset.state = state;
+                status.replaceChildren(icon({running: "loader", done: "check-circle", failed: "alert", skipped: "dot", pending: "dot"}[state] || "dot",
+                    16, state === "running" ? "spin" : ""));
+                detail.textContent = text || "";
+                body.replaceChildren();
+                if (json !== undefined) {
+                    body.appendChild(h("details", {open: state === "failed"},
+                        h("summary", {text: jsonLabel || "Details"}), codeBlock(json)));
+                }
+            },
+            add(label, json) {
+                body.appendChild(h("details", null, h("summary", {text: label}), codeBlock(json)));
+            },
+        };
+    }
+
+    async function runFlow(item) {
+        if (!passkeysAvailable()) {
+            toast("Passkey flows need grpcui's database", {variant: "error"});
+            return;
+        }
+        const f = item.flow;
+        const kind = item.kind;
+        const steps = {
+            begin: stepRow("Begin · " + f.begin.service + "/" + f.begin.method),
+            sign: stepRow(kind === "register" ? "Create passkey" : "Sign the challenge"),
+            finish: stepRow("Finish · " + f.finish.service + "/" + f.finish.method),
+        };
+        if (kind === "register") {
+            steps.save = stepRow("Keep passkey");
+        }
+        Object.values(steps).forEach(s => s.set("pending", ""));
+
+        const closeBtn = h("button", {type: "button", class: "btn btn-outline btn-sm"}, "Close");
+        const editBtn = h("button", {type: "button", class: "btn btn-ghost btn-sm"}, icon("pencil", 14), "Edit flow");
+        const againBtn = h("button", {type: "button", class: "btn btn-primary btn-sm", disabled: true}, icon("play", 14), "Run again");
+        const summary = h("div", {class: "pk-run-summary"});
+        const dlg = h("dialog", {class: "dialog dialog-wide", "aria-label": "Run " + item.name},
+            h("h2", {class: "dialog-title"}, item.name, " ", h("span", {class: "badge badge-secondary", text: flowKindLabel(kind)})),
+            h("p", {class: "dialog-desc", text: (f.authenticator === "device" ? "This device's passkey" : "grpcui's passkey") +
+                " · origin " + flowOrigin(f)}),
+            h("ol", {class: "pk-steps"}, Object.values(steps).map(s => s.el)),
+            summary,
+            h("div", {class: "dialog-actions"}, editBtn, h("div", {class: "gu-spacer"}), closeBtn, againBtn));
+        closeBtn.addEventListener("click", () => dlg.close());
+        againBtn.addEventListener("click", () => {
+            dlg.close();
+            runFlow(item);
+        });
+        editBtn.addEventListener("click", () => {
+            dlg.close();
+            openFlowEditor(item);
+        });
+        dlg.addEventListener("close", () => dlg.remove());
+        ROOT.appendChild(dlg);
+        dlg.showModal();
+
+        const fail = (step, text, json) => {
+            step.set("failed", text, json, "What happened");
+            summary.replaceChildren(alertBox("destructive", "The flow stopped", text));
+        };
+        let created = null; // a passkey made by this run, until the server accepts it
+        try {
+            // 1. begin
+            steps.begin.set("running", "Calling the server…");
+            const beginReq = f.begin.request || {};
+            const begin = await callFlowRPC(f.begin, isUnset(beginReq.data) ? {} : beginReq.data);
+            if (begin.error) {
+                fail(steps.begin, begin.error, begin.raw || undefined);
+                return;
+            }
+            steps.begin.set("done", "Got the challenge", begin.message, "Response");
+
+            // 2. options
+            const beginSchema = await methodSchema(f.begin.service, f.begin.method);
+            const leaves = new Map(schemaLeaves(beginSchema, beginSchema.responseType, true).map(l => [l.path, l]));
+            const built = buildOptions(kind, f, begin.message, leaves);
+            if (built.problems.length) {
+                fail(steps.sign, "Couldn't build the passkey options: " + built.problems.join("; "), built.options);
+                return;
+            }
+            const options = built.options;
+            const origin = flowOrigin(f);
+            const rpId = kind === "register" ? options.rp.id : options.rpId;
+            steps.sign.set("running", f.authenticator === "device" ? "Waiting for your passkey…" : "Signing…");
+
+            // 3. create or sign
+            let credential;
+            let usedPasskey = null;
+            if (f.authenticator === "device") {
+                const problem = deviceProblem(rpId);
+                if (problem) {
+                    fail(steps.sign, problem, options);
+                    return;
+                }
+                try {
+                    credential = kind === "register" ? await deviceCreate(options) : await deviceGet(options);
+                } catch (e) {
+                    fail(steps.sign, (e.name ? e.name + ": " : "") + e.message, options);
+                    return;
+                }
+                if (kind === "register") {
+                    created = await storageAPI("/passkeys", {
+                        method: "POST",
+                        body: {
+                            rpId: rpId, origin: origin, credentialId: credential.id, userId: options.user.id,
+                            userName: options.user.name, displayName: options.user.displayName || "",
+                            publicKey: (credential.response && credential.response.publicKey) || "",
+                        },
+                    });
+                }
+            } else if (kind === "register") {
+                try {
+                    const res = await storageAPI("/passkeys/create", {method: "POST", body: {options: options, origin: origin}});
+                    created = res.passkey;
+                    credential = res.credential;
+                } catch (e) {
+                    fail(steps.sign, e.message, options);
+                    return;
+                }
+            } else {
+                await reloadPasskeys();
+                const allow = (options.allowCredentials || []).map(d => bytesToB64url(b64ToBytes(d.id)));
+                const cands = passkeys.filter(p => p.kind === "virtual" && p.status === "confirmed" && p.rpId === rpId &&
+                    (!allow.length || allow.includes(p.credentialId)))
+                    .sort((a, b) => String(b.lastUsedAt || b.createdAt).localeCompare(String(a.lastUsedAt || a.createdAt)));
+                if (!cands.length) {
+                    fail(steps.sign, allow.length
+                        ? "None of grpcui's passkeys for " + rpId + " is in the server's allowCredentials. Run a registration flow for this user first."
+                        : "grpcui has no passkeys for " + rpId + ". Run a registration flow first.", options);
+                    return;
+                }
+                usedPasskey = cands.length === 1 ? cands[0] : await choosePasskey(cands);
+                if (!usedPasskey) {
+                    fail(steps.sign, "No passkey was chosen.");
+                    return;
+                }
+                try {
+                    const res = await storageAPI("/passkeys/sign", {method: "POST", body: {options: options, origin: origin, id: usedPasskey.id}});
+                    usedPasskey = res.passkey;
+                    credential = res.credential;
+                } catch (e) {
+                    fail(steps.sign, e.message, options);
+                    return;
+                }
+            }
+            const who = created || usedPasskey;
+            steps.sign.set("done", who
+                ? (who.userName || "passkey") + " · " + who.rpId + " · ID " + shortID(who.credentialId) + (usedPasskey ? " · sign count " + usedPasskey.signCount : "")
+                : "Done", credential, "Credential");
+            steps.sign.add("Options sent to the passkey", options);
+
+            // 4. finish
+            const finishSchema = await methodSchema(f.finish.service, f.finish.method);
+            const fLeaves = new Map(schemaLeaves(finishSchema, finishSchema.requestType, false).map(l => [l.path, l]));
+            const req = buildFinishRequest(kind, f, begin.message, credential, fLeaves);
+            if (req.problems.length) {
+                fail(steps.finish, req.problems.join("; "), req.data);
+                return;
+            }
+            steps.finish.set("running", "Calling the server…");
+            const finish = await callFlowRPC(f.finish, req.data);
+            if (finish.error) {
+                fail(steps.finish, finish.error, finish.raw || req.data);
+                steps.finish.add("Request", req.data);
+                return;
+            }
+            steps.finish.set("done", kind === "register" ? "The server accepted the passkey" : "The server accepted the signature", finish.message, "Response");
+            steps.finish.add("Request", req.data);
+
+            // 5. keep
+            if (created) {
+                await storageAPI("/passkeys/" + encodeURIComponent(created.id) + "/confirm", {method: "POST"});
+                steps.save.set("done", "Saved " + (created.userName || "the passkey") + " for " + created.rpId);
+                created = null;
+            }
+            summary.replaceChildren(h("div", {class: "alert alert-success", role: "status"}, icon("check-circle", 16),
+                h("div", {class: "alert-body"}, h("div", {class: "alert-title",
+                    text: kind === "register" ? "Passkey created" : "Signed in"}))));
+        } catch (e) {
+            if (debug) {
+                console.trace(e);
+            }
+            summary.replaceChildren(alertBox("destructive", "The flow stopped", e.message || String(e)));
+        } finally {
+            if (created) {
+                // the server didn't accept it, so don't keep it
+                try {
+                    await storageAPI("/passkeys/" + encodeURIComponent(created.id), {method: "DELETE"});
+                    steps.save.set("skipped", "Removed the passkey the server didn't accept");
+                } catch (e) {
+                    steps.save.set("failed", "Couldn't remove the unaccepted passkey: " + e.message);
+                }
+            }
+            Object.values(steps).forEach(s => s.el.dataset.state === "pending" && s.set("skipped", "Not run"));
+            againBtn.disabled = false;
+            reloadPasskeys().catch(() => {});
+        }
+    }
+
+    // ----- the flow editor -----
+
+    function methodOptions(selected) {
+        const out = [h("option", {value: "", text: "Choose a method…"})];
+        for (const svc of serviceNames) {
+            const group = h("optgroup", {label: svc});
+            for (const m of services[svc]) {
+                const v = svc + "/" + m.name;
+                group.appendChild(h("option", {value: v, text: m.name, selected: v === selected}));
+            }
+            out.push(group);
+        }
+        return out;
+    }
+
+    function splitMethod(v) {
+        const i = v.lastIndexOf("/");
+        return i < 0 ? {service: "", method: ""} : {service: v.slice(0, i), method: v.slice(i + 1)};
+    }
+
+    function jsonArea(value, rows) {
+        const ta = h("textarea", {class: "input input-sm code-input pk-json", rows: String(rows || 3), spellcheck: "false"});
+        ta.value = JSON.stringify(isUnset(value) ? {} : value, null, 2);
+        return ta;
+    }
+
+    function parseArea(ta, what) {
+        try {
+            const v = JSON.parse(ta.value.trim() || "{}");
+            if (v === null || typeof v !== "object" || Array.isArray(v)) {
+                throw new Error("must be a JSON object");
+            }
+            markValid(ta);
+            return v;
+        } catch (e) {
+            markInvalid(ta, e.message);
+            throw new Error(what + ": " + e.message);
+        }
+    }
+
+    // A source select. choices: [{value, label, group}]. value encodes the
+    // source: "" (none), "=" (fixed value), "r:path", "c:key".
+    function sourceSelect(choices, current, noneLabel) {
+        const sel = h("select", {class: "select input-sm"});
+        sel.appendChild(h("option", {value: "", text: noneLabel}));
+        sel.appendChild(h("option", {value: "=", text: "Fixed value…"}));
+        const groups = new Map();
+        for (const c of choices) {
+            if (!groups.has(c.group)) {
+                groups.set(c.group, h("optgroup", {label: c.group}));
+                sel.appendChild(groups.get(c.group));
+            }
+            groups.get(c.group).appendChild(h("option", {value: c.value, text: c.label}));
+        }
+        sel.value = current;
+        if (sel.value !== current) {
+            // a field the schema no longer has: keep it visible
+            sel.appendChild(h("option", {value: current, text: current.slice(2) + " (missing)"}));
+            sel.value = current;
+        }
+        return sel;
+    }
+
+    function srcValue(src) {
+        if (!src || !src.from) {
+            return "";
+        }
+        return src.from === "value" ? "=" : src.from === "credential" ? "c:" + src.key : "r:" + src.path;
+    }
+
+    function srcFromValue(v, prev) {
+        if (!v) {
+            return null;
+        }
+        if (v === "=") {
+            return {from: "value", value: prev && prev.from === "value" ? prev.value : ""};
+        }
+        if (v.startsWith("c:")) {
+            return {from: "credential", key: v.slice(2)};
+        }
+        return {from: "response", path: v.slice(2), enc: prev && prev.enc};
+    }
+
+    // Opens the editor for a new flow (item without id) or a saved one.
+    // sample is a begin response message to preview with, if there is one.
+    async function openFlowEditor(item, sample) {
+        item = JSON.parse(JSON.stringify(item));
+        const f = item.flow;
+        f.begin = f.begin || {service: "", method: "", request: {data: {}}};
+        f.finish = f.finish || {service: "", method: "", request: {data: {}}};
+        f.map = f.map || {};
+        f.result = f.result || {};
+        f.authenticator = f.authenticator || "virtual";
+        f.origin = f.origin || "https://localhost";
+        let kind = item.kind || "login";
+        let beginSchema = null;
+        let finishSchema = null;
+        let beginLeaves = [];
+        let finishLeaves = [];
+
+        const nameF = dialogField("Name", {value: item.name || "", placeholder: "Sign in as alice"});
+        const kindSeg = h("div", {class: "segmented", role: "group", "aria-label": "Kind"});
+        const kindBtns = ["register", "login"].map(k => {
+            const b = h("button", {type: "button", "aria-pressed": String(k === kind)}, flowKindLabel(k));
+            b.addEventListener("click", () => {
+                kind = k;
+                kindBtns.forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+                renderMaps();
+            });
+            kindSeg.appendChild(b);
+            return b;
+        });
+        const authSel = h("select", {class: "select input-sm"},
+            h("option", {value: "virtual", text: "grpcui's passkey (works for any site)"}),
+            h("option", {value: "device", text: "This device's passkey (Touch ID, security key)"}));
+        authSel.value = f.authenticator;
+        const originInput = h("input", {type: "text", class: "input input-sm mono", value: f.origin, autocomplete: "off", spellcheck: "false"});
+        const originField = h("label", {class: "dlg-field"}, h("span", {class: "dlg-label", text: "Origin"}), originInput,
+            h("span", {class: "dlg-hint", text: "Written into clientDataJSON; the server must accept it. rp.id defaults to its host."}));
+        const deviceNote = h("p", {class: "dlg-hint"});
+        const updateAuth = () => {
+            f.authenticator = authSel.value;
+            originField.hidden = f.authenticator === "device";
+            const p = f.authenticator === "device" ? deviceProblem("") : "";
+            deviceNote.textContent = f.authenticator === "device"
+                ? (p || "Uses origin " + window.location.origin + ". It only works when the server's relying party ID is " + window.location.hostname + ".")
+                : "";
+            deviceNote.hidden = !deviceNote.textContent;
+            renderPreview();
+        };
+        authSel.addEventListener("change", updateAuth);
+        originInput.addEventListener("input", () => {
+            f.origin = originInput.value.trim();
+            renderPreview();
+        });
+
+        const beginSel = h("select", {class: "select input-sm"}, methodOptions(f.begin.service ? f.begin.service + "/" + f.begin.method : ""));
+        const finishSel = h("select", {class: "select input-sm"}, methodOptions(f.finish.service ? f.finish.service + "/" + f.finish.method : ""));
+        const beginBody = jsonArea(f.begin.request && f.begin.request.data, 3);
+        const finishBody = jsonArea(f.finish.request && f.finish.request.data, 2);
+        const sampleBtn = h("button", {type: "button", class: "btn btn-outline btn-xs"}, icon("play", 12), "Call Begin for a preview");
+        const optionsTable = h("div", {class: "pk-map"});
+        const resultTable = h("div", {class: "pk-map"});
+        const preview = h("div", {class: "pk-preview"});
+
+        function section(n, title, desc, ...children) {
+            return h("div", {class: "pk-section"},
+                h("div", {class: "pk-section-head"}, h("span", {class: "pk-num", text: String(n)}),
+                    h("div", null, h("div", {class: "pk-section-title", text: title}), desc ? h("div", {class: "dlg-hint", text: desc}) : null)),
+                ...children);
+        }
+
+        async function loadBegin(guess) {
+            const m = splitMethod(beginSel.value);
+            f.begin.service = m.service;
+            f.begin.method = m.method;
+            beginSchema = null;
+            beginLeaves = [];
+            if (m.method) {
+                try {
+                    beginSchema = await methodSchema(m.service, m.method);
+                    beginLeaves = schemaLeaves(beginSchema, beginSchema.responseType, true);
+                } catch (e) {
+                    toast("Couldn't load " + m.method, {variant: "error", description: e.message});
+                }
+            }
+            if (guess && m.method) {
+                if (!item.id && !f.finish.method) {
+                    const fin = guessFinish(m.service, m.method);
+                    if (fin) {
+                        finishSel.value = m.service + "/" + fin;
+                        await loadFinish(false);
+                    }
+                }
+                guessMappings(kind, f, beginLeaves, finishLeaves, sample);
+            }
+            renderMaps();
+        }
+
+        async function loadFinish(guess) {
+            const m = splitMethod(finishSel.value);
+            f.finish.service = m.service;
+            f.finish.method = m.method;
+            finishSchema = null;
+            finishLeaves = [];
+            if (m.method) {
+                try {
+                    finishSchema = await methodSchema(m.service, m.method);
+                    finishLeaves = schemaLeaves(finishSchema, finishSchema.requestType, false);
+                } catch (e) {
+                    toast("Couldn't load " + m.method, {variant: "error", description: e.message});
+                }
+            }
+            if (guess) {
+                guessMappings(kind, f, beginLeaves, finishLeaves, sample);
+            }
+            renderMaps();
+        }
+
+        beginSel.addEventListener("change", () => {
+            sample = null;
+            loadBegin(true);
+        });
+        finishSel.addEventListener("change", () => loadFinish(true));
+        sampleBtn.addEventListener("click", async () => {
+            let data;
+            try {
+                data = parseArea(beginBody, "Begin request");
+            } catch (e) {
+                return;
+            }
+            if (!f.begin.method) {
+                return;
+            }
+            sampleBtn.disabled = true;
+            const res = await callFlowRPC({service: f.begin.service, method: f.begin.method, request: Object.assign({}, f.begin.request, {data: data})}, data);
+            sampleBtn.disabled = false;
+            if (res.error) {
+                toast("Begin failed", {variant: "error", description: res.error});
+                return;
+            }
+            sample = res.message;
+            guessMappings(kind, f, beginLeaves, finishLeaves, sample);
+            renderMaps();
+        });
+
+        function binaryEncSelect(src) {
+            const sel = h("select", {class: "select input-sm pk-enc", "aria-label": "Encoding", "data-tooltip": "How to read the value as bytes"},
+                h("option", {value: "auto", text: "Auto"}), h("option", {value: "base64", text: "Base64"}),
+                h("option", {value: "text", text: "Text"}), h("option", {value: "hex", text: "Hex"}));
+            sel.value = src.enc || "auto";
+            sel.addEventListener("change", () => {
+                src.enc = sel.value;
+                renderPreview();
+            });
+            return sel;
+        }
+
+        function mapRow(label, required, hint, sel, extra) {
+            return h("div", {class: "pk-map-row"},
+                h("div", {class: "pk-map-label"}, h("span", {class: "mono", text: label}), required ? h("span", {class: "required", text: "*"}) : null,
+                    hint ? h("div", {class: "dlg-hint", text: hint}) : null),
+                h("div", {class: "pk-map-src"}, sel, extra));
+        }
+
+        function renderMaps() {
+            // options ← begin response
+            const respChoices = beginLeaves.map(l => ({value: "r:" + l.path, label: leafLabel(l), group: "Begin response"}));
+            const rows = [];
+            const wholeChoices = respChoices.filter(c => {
+                const l = beginLeaves.find(x => "r:" + x.path === c.value);
+                return l && !l.isArray && (l.type === "string" || l.type === "google.protobuf.Struct");
+            });
+            const wholeSel = sourceSelect(wholeChoices, srcValue(f.map.$whole), "Not used");
+            wholeSel.querySelector('option[value="="]').remove();
+            wholeSel.addEventListener("change", () => {
+                f.map.$whole = srcFromValue(wholeSel.value, f.map.$whole);
+                renderMaps();
+            });
+            rows.push(mapRow("whole options (JSON)", false, "For servers that send all the options as one JSON field. Fields below override it.", wholeSel));
+            for (const def of OPTION_FIELDS[kind]) {
+                const src = f.map[def.key];
+                const sel = sourceSelect(respChoices, srcValue(src), f.map.$whole ? "From whole options" : (def.hint ? "Default" : "Not mapped"));
+                sel.addEventListener("change", () => {
+                    f.map[def.key] = srcFromValue(sel.value, f.map[def.key]);
+                    renderMaps();
+                });
+                const extra = [];
+                if (src && src.from === "value") {
+                    const input = h("input", {type: "text", class: "input input-sm mono", value: src.value || "", placeholder: def.binary ? "base64url or text" : "", autocomplete: "off", spellcheck: "false"});
+                    input.addEventListener("input", () => {
+                        src.value = input.value;
+                        renderPreview();
+                    });
+                    extra.push(input);
+                }
+                if (src && src.from && def.binary) {
+                    extra.push(binaryEncSelect(src));
+                }
+                rows.push(mapRow(def.label, def.required && !f.map.$whole, def.hint, sel, extra));
+            }
+            optionsTable.replaceChildren(...rows);
+
+            // finish request ← credential / begin response
+            const credChoices = CREDENTIAL_PARTS[kind].map(p => ({value: "c:" + p.key, label: p.label, group: "Passkey result"}));
+            const choices = credChoices.concat(respChoices);
+            const fRows = [];
+            if (!finishLeaves.length) {
+                fRows.push(h("p", {class: "muted text-sm", text: f.finish.method ? "This method's request has no fields." : "Choose the finish method."}));
+            }
+            for (const l of finishLeaves) {
+                const src = f.result[l.path];
+                const sel = sourceSelect(choices, srcValue(src), "Leave as in the request body");
+                sel.addEventListener("change", () => {
+                    f.result[l.path] = srcFromValue(sel.value, f.result[l.path]);
+                    if (!f.result[l.path]) {
+                        delete f.result[l.path];
+                    }
+                    renderMaps();
+                });
+                const extra = [];
+                if (src && src.from === "value") {
+                    const input = h("input", {type: "text", class: "input input-sm mono", value: src.value || "", autocomplete: "off", spellcheck: "false"});
+                    input.addEventListener("input", () => src.value = input.value);
+                    extra.push(input);
+                }
+                fRows.push(mapRow(leafLabel(l), false, null, sel, extra));
+            }
+            resultTable.replaceChildren(...fRows);
+            renderPreview();
+        }
+
+        function renderPreview() {
+            if (!sample) {
+                preview.replaceChildren(h("div", {class: "notice"},
+                    h("span", {class: "muted text-sm", text: f.begin.method ? "No begin response to preview with yet." : "Choose the begin method."}),
+                    h("div", {class: "gu-spacer"}), f.begin.method ? sampleBtn : null));
+                return;
+            }
+            const leaves = new Map(beginLeaves.map(l => [l.path, l]));
+            const built = buildOptions(kind, f, sample, leaves);
+            preview.replaceChildren(
+                h("div", {class: "pk-preview-head"}, h("span", {class: "dlg-label", text: "Options the passkey will get, from the last begin response"}),
+                    h("div", {class: "gu-spacer"}), sampleBtn),
+                ...(built.problems.length ? [alertBox("warning", "Not ready yet", built.problems.join("; "))] : []),
+                codeBlock(built.options));
+        }
+
+        const form = [
+            nameF.el,
+            h("div", {class: "pk-row"},
+                h("div", {class: "dlg-field"}, h("span", {class: "dlg-label", text: "What it does"}), kindSeg),
+                h("label", {class: "dlg-field", style: {flex: "1"}}, h("span", {class: "dlg-label", text: "Passkey"}), authSel)),
+            originField,
+            deviceNote,
+            section(1, "Begin", "Called first. Its response holds the challenge.",
+                h("label", {class: "dlg-field"}, h("span", {class: "dlg-label", text: "Method"}), beginSel),
+                h("label", {class: "dlg-field"}, h("span", {class: "dlg-label", text: "Request body"}), beginBody)),
+            section(2, "Passkey options", "Which begin response fields the passkey needs. Guessed from field names; check them.",
+                optionsTable, preview),
+            section(3, "Finish", "Called with what the passkey returned.",
+                h("label", {class: "dlg-field"}, h("span", {class: "dlg-label", text: "Method"}), finishSel),
+                h("label", {class: "dlg-field"}, h("span", {class: "dlg-label", text: "Request body"}), finishBody,
+                    h("span", {class: "dlg-hint", text: "Fields mapped below replace these values."})),
+                resultTable),
+        ];
+
+        const ready = (async () => {
+            updateAuth();
+            await loadFinish(false);
+            await loadBegin(!item.id);
+        })();
+
+        let saved = null;
+        const ok = await openFormDialog({
+            title: item.id ? "Edit passkey flow" : "New passkey flow",
+            description: "Maps a begin RPC's response to a passkey, and the passkey's result to a finish RPC's request.",
+            body: form,
+            className: "dialog-wide",
+            submitLabel: item.id ? "Save" : "Save and run",
+            onSubmit: async () => {
+                await ready;
+                const name = nameF.input.value.trim();
+                if (!name) {
+                    throw new Error("Give the flow a name.");
+                }
+                if (!f.begin.method || !f.finish.method) {
+                    throw new Error("Choose the begin and finish methods.");
+                }
+                f.begin.request = Object.assign({}, f.begin.request, {data: parseArea(beginBody, "Begin request body")});
+                f.finish.request = Object.assign({}, f.finish.request, {data: parseArea(finishBody, "Finish request body")});
+                if (f.authenticator === "device") {
+                    delete f.origin;
+                } else if (!originHost(f.origin)) {
+                    throw new Error("The origin must look like https://example.com.");
+                }
+                // drop mappings for fields of the other kind
+                const keys = new Set(OPTION_FIELDS[kind].map(d => d.key).concat(["$whole"]));
+                Object.keys(f.map).forEach(k => (!keys.has(k) || !f.map[k]) && delete f.map[k]);
+                const parts = new Set(CREDENTIAL_PARTS[kind].map(p => p.key));
+                Object.keys(f.result).forEach(k => {
+                    const s = f.result[k];
+                    if (!s || (s.from === "credential" && !parts.has(s.key))) {
+                        delete f.result[k];
+                    }
+                });
+                saved = await flowStore.save({id: item.id, name: name, kind: kind, flow: f});
+            },
+        });
+        if (ok && saved) {
+            await reloadPasskeys().catch(() => {});
+            if (!item.id) {
+                runFlow(saved);
+            } else {
+                toast("Saved “" + saved.name + "”", {variant: "success"});
+            }
+        }
+    }
+
+    // Starts a new flow from a response shown in the response panel.
+    function newFlowFromResponse(src) {
+        const kind = guessKind(src.method, src.message);
+        openFlowEditor({
+            name: flowKindLabel(kind) + " · " + src.method.replace(/^(Begin|Start)/, ""),
+            kind: kind,
+            flow: {
+                authenticator: "virtual",
+                origin: "https://localhost",
+                begin: {service: src.service, method: src.method, request: src.request},
+                finish: {service: "", method: "", request: {data: {}}},
+                map: {},
+                result: {},
+            },
+        }, src.message);
+    }
+
+    // Adds the "make a passkey flow" notice to a response that looks like
+    // WebAuthn options.
+    function offerPasskeyFlow(service, method, request, resp) {
+        if (!passkeysAvailable() || !resp || resp.error) {
+            return;
+        }
+        const msgs = (resp.responses || []).filter(m => !m.isError);
+        if (msgs.length !== 1 || !looksLikePasskeyOptions(msgs[0].message)) {
+            return;
+        }
+        const panel = qs('[data-panel="body"]', els.response);
+        if (!panel) {
+            return;
+        }
+        const existing = flows.filter(x => x.flow && x.flow.begin && x.flow.begin.service === service && x.flow.begin.method === method);
+        const make = h("button", {type: "button", class: "btn btn-outline btn-xs"}, icon("plus", 12), "Make a passkey flow");
+        make.addEventListener("click", () => newFlowFromResponse({service: service, method: method, request: request, message: msgs[0].message}));
+        const runs = existing.slice(0, 2).map(x => {
+            const b = h("button", {type: "button", class: "btn btn-primary btn-xs"}, icon("play", 12), "Run “" + x.name + "”");
+            b.addEventListener("click", () => runFlow(x));
+            return b;
+        });
+        panel.prepend(h("div", {class: "resp-section"}, h("div", {class: "notice pk-offer"}, icon("key", 16),
+            h("span", {text: "This response has a passkey challenge."}), h("div", {class: "gu-spacer"}), ...runs, make)));
+    }
+
+    // ----- the Passkeys sheet -----
+
+    function renderPasskeySheet() {
+        const v = passkeyView;
+        if (!v) {
+            return;
+        }
+        const fl = flows.map(x => {
+            const run = h("button", {type: "button", class: "btn btn-outline btn-xs"}, icon("play", 12), "Run");
+            const edit = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Edit " + x.name, "data-tooltip": "Edit"}, icon("pencil", 13));
+            const del = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Delete " + x.name, "data-tooltip": "Delete"}, icon("trash", 14));
+            run.addEventListener("click", () => runFlow(x));
+            edit.addEventListener("click", () => openFlowEditor(x));
+            del.addEventListener("click", async () => {
+                const ok = await confirmDialog({
+                    title: "Delete “" + x.name + "”?",
+                    description: "This removes the flow. Passkeys it made are kept.",
+                    confirmLabel: "Delete",
+                    destructive: true,
+                });
+                if (ok) {
+                    try {
+                        await flowStore.remove(x.id);
+                        await reloadPasskeys();
+                    } catch (e) {
+                        toast("Couldn't delete the flow", {variant: "error", description: e.message});
+                    }
+                }
+            });
+            const fb = x.flow || {};
+            return h("div", {class: "saved-item pk-item"},
+                h("div", {class: "saved-main"},
+                    h("div", {class: "saved-name"}, x.name, " ", h("span", {class: "badge badge-secondary", text: flowKindLabel(x.kind)})),
+                    h("div", {class: "saved-meta mono", text: (fb.begin ? fb.begin.method : "?") + " → " + (fb.finish ? fb.finish.method : "?") +
+                        (fb.authenticator === "device" ? " · device passkey" : " · " + (fb.origin || ""))})),
+                h("div", {class: "hist-actions"}, run, edit, del));
+        });
+        v.flows.replaceChildren(...(fl.length ? fl : [h("p", {class: "muted text-sm",
+            text: "No flows yet. Call a method that starts a passkey registration or login, then choose “Make a passkey flow” on its response."})]));
+
+        const groups = new Map();
+        passkeys.forEach(p => {
+            if (!groups.has(p.rpId)) {
+                groups.set(p.rpId, []);
+            }
+            groups.get(p.rpId).push(p);
+        });
+        const pk = [];
+        for (const [rpId, items] of groups) {
+            pk.push(h("div", {class: "pk-site", text: rpId}));
+            for (const p of items) {
+                const copy = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Copy credential ID", "data-tooltip": "Copy credential ID"}, icon("copy", 13));
+                const del = h("button", {type: "button", class: "btn btn-ghost btn-icon btn-xs", "aria-label": "Delete passkey", "data-tooltip": "Delete"}, icon("trash", 14));
+                copy.addEventListener("click", async () => {
+                    const ok = await copyText(p.credentialId);
+                    toast(ok ? "Copied the credential ID" : "Couldn't copy the credential ID", {variant: ok ? "success" : "error"});
+                });
+                del.addEventListener("click", async () => {
+                    const ok = await confirmDialog({
+                        title: "Delete this passkey?",
+                        description: p.kind === "virtual"
+                            ? "grpcui forgets " + (p.userName || "this passkey") + "'s key for " + p.rpId + ", so it can't sign in with it again. The server still lists it. You can't undo this."
+                            : "grpcui forgets this record. The passkey itself stays on your device.",
+                        confirmLabel: "Delete",
+                        destructive: true,
+                    });
+                    if (ok) {
+                        try {
+                            await storageAPI("/passkeys/" + encodeURIComponent(p.id), {method: "DELETE"});
+                            await reloadPasskeys();
+                        } catch (e) {
+                            toast("Couldn't delete the passkey", {variant: "error", description: e.message});
+                        }
+                    }
+                });
+                const meta = ["ID " + shortID(p.credentialId)];
+                if (p.kind === "virtual") {
+                    meta.push("sign count " + p.signCount);
+                }
+                meta.push(p.lastUsedAt ? "used " + formatTime(p.lastUsedAt) : "made " + formatTime(p.createdAt));
+                pk.push(h("div", {class: "saved-item pk-item"},
+                    h("div", {class: "saved-main"},
+                        h("div", {class: "saved-name"}, p.userName || "(no name)", " ",
+                            h("span", {class: "badge badge-outline", text: p.kind === "virtual" ? "grpcui" : "device"}), " ",
+                            p.status === "pending" ? h("span", {class: "badge badge-warning", "data-tooltip": "The server hasn't accepted it", text: "pending"}) : null),
+                        h("div", {class: "saved-meta mono", text: meta.join(" · ")})),
+                    h("div", {class: "hist-actions"}, copy, del)));
+            }
+        }
+        v.passkeys.replaceChildren(...(pk.length ? pk : [h("p", {class: "muted text-sm", text: "No passkeys yet. A registration flow makes one."})]));
+    }
+
+    function openPasskeySheet() {
+        if (!passkeysAvailable()) {
+            toast("Passkey flows need grpcui's database", {variant: "error", description: "Start grpcui with -db, or on a loopback address."});
+            return;
+        }
+        const flowsEl = h("div", {class: "saved-list"});
+        const pkEl = h("div", {class: "saved-list"});
+        const newBtn = h("button", {type: "button", class: "btn btn-primary btn-sm"}, icon("plus", 14), "New flow");
+        openSheet({
+            title: "Passkeys",
+            description: "Flows run a server's passkey RPCs. grpcui's passkeys are kept in its database on this computer.",
+            body: [h("h3", {class: "pk-heading", text: "Flows"}), flowsEl, h("h3", {class: "pk-heading", text: "Passkeys"}), pkEl],
+            footer: [h("div", {class: "gu-spacer"}), newBtn],
+            onClose: () => {
+                passkeyView = null;
+            },
+        });
+        passkeyView = {flows: flowsEl, passkeys: pkEl};
+        newBtn.addEventListener("click", () => {
+            const begin = state.service && state.method ? {service: state.service, method: state.method, request: currentRequestSnapshot().request} : null;
+            openFlowEditor({
+                name: "",
+                kind: begin ? guessKind(begin.method) : "login",
+                flow: {authenticator: "virtual", origin: "https://localhost", begin: begin, map: {}, result: {}},
+            });
+        });
+        renderPasskeySheet();
+        reloadPasskeys().catch(e => toast("Couldn't load passkeys", {variant: "error", description: e.message}));
+    }
+
+    if (passkeysBtn) {
+        passkeysBtn.hidden = !storageURI;
+        passkeysBtn.addEventListener("click", openPasskeySheet);
+    }
+    if (storageURI) {
+        reloadPasskeys().catch(() => {});
+    }
 
     // ---------------------------------------------------------------------
     // Start up

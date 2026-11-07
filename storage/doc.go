@@ -1,5 +1,5 @@
-// Package storage keeps the gRPC web UI's request history and saved requests
-// in a SQLite database, and serves them to the web form over a small JSON API.
+// Package storage keeps the gRPC web UI's request history, saved requests,
+// passkeys and passkey flows in a SQLite database, and serves them to the web form over a small JSON API.
 //
 // Open the database with Open and mount the handler returned by
 // Store.Handler. The handler's paths are relative, so mount it under a prefix
@@ -73,6 +73,44 @@
 // "<name> (3)" and so on; "imported" counts these items too, and "renamed"
 // says how many there were. An import imports nothing if any item is invalid. The import body may also be a bare
 // JSON array of items, such as the contents of an -examples file.
+//
+// # Passkeys
+//
+// Passkeys are made and used by passkey flows in the web form. A "virtual"
+// passkey is made by grpcui's own authenticator, which keeps its private key
+// in this database (the API never returns it) and can sign for any relying
+// party ID. A "device" passkey lives on a real authenticator such as Touch ID
+// or a security key; the database only records it. A passkey is "pending"
+// until the server accepts it, then "confirmed". Only confirmed virtual
+// passkeys sign. Binary values are base64url.
+//
+//	GET    /passkeys               {"items":[...]}, by rpId and userName
+//	POST   /passkeys/create        {"options":{...},"origin":O} -> {"passkey":{...},"credential":{...}}
+//	POST   /passkeys/sign          {"options":{...},"origin":O,"id":N} -> {"passkey":{...},"credential":{...}}
+//	POST   /passkeys               a device passkey {"rpId","origin","credentialId",...} -> the passkey
+//	POST   /passkeys/{id}/confirm  marks it accepted -> the passkey
+//	DELETE /passkeys/{id}          removes one passkey
+//
+// The options are PublicKeyCredentialCreationOptionsJSON for create and
+// PublicKeyCredentialRequestOptionsJSON for sign, and the credential is what
+// PublicKeyCredential.toJSON() returns, so it can be sent as is to servers
+// built on WebAuthn libraries. The origin is the one written into the
+// client data, such as "https://example.com"; when the options have no
+// relying party ID, it is the origin's host. Sign uses the passkey with the
+// given id, or (when id is 0) the most recently used one the options allow,
+// and increases its sign count. Options the authenticator can't use, such as
+// a challenge that isn't base64, get status 422 with a message saying why.
+//
+// # Passkey flows
+//
+// A flow names the RPCs that begin and finish a passkey ceremony and how
+// their fields map to and from the passkey. The web form defines and runs
+// flows; the store keeps "flow" as an opaque JSON object.
+//
+//	GET    /flows                  {"items":[...]}, by name
+//	POST   /flows                  {"name":"...","kind":"register"|"login","flow":{...}} -> the stored flow
+//	PUT    /flows/{id}             the same -> the updated flow
+//	DELETE /flows/{id}             removes one flow
 //
 // # Errors
 //

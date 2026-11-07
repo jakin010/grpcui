@@ -178,6 +178,7 @@ func RPCMetadataHandler(methods []*desc.MethodDescriptor, files []*desc.FileDesc
 type schema struct {
 	RequestType   string                  `json:"requestType"`
 	RequestStream bool                    `json:"requestStream"`
+	ResponseType  string                  `json:"responseType,omitempty"`
 	MessageTypes  map[string][]fieldDef   `json:"messageTypes"`
 	EnumTypes     map[string][]enumValDef `json:"enumTypes"`
 }
@@ -263,11 +264,15 @@ func gatherMetadataForMethod(md *desc.MethodDescriptor) (*schema, error) {
 	result := &schema{
 		RequestType:   msg.GetFullyQualifiedName(),
 		RequestStream: md.IsClientStreaming(),
+		ResponseType:  md.GetOutputType().GetFullyQualifiedName(),
 		MessageTypes:  map[string][]fieldDef{},
 		EnumTypes:     map[string][]enumValDef{},
 	}
 
 	result.visitMessage(msg)
+	// the response type is described too, for features that read responses
+	// (such as passkey flows)
+	result.visitMessage(md.GetOutputType())
 
 	return result, nil
 }
