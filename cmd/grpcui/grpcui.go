@@ -1074,6 +1074,13 @@ func (t *teeWriter) WriteHeader(statusCode int) {
 	}
 }
 
+// Flush sends buffered data on to the client, so live calls stream events as
+// they happen.
+func (t *teeWriter) Flush() {
+	t.mirrorHeaders()
+	_ = http.NewResponseController(t.w[0]).Flush()
+}
+
 func (t *teeWriter) mirrorHeaders() {
 	if t.hdrsWritten {
 		return
@@ -1115,6 +1122,11 @@ func (cs *codeSniffer) Write(b []byte) (int, error) {
 	}
 	cs.size += len(b)
 	return cs.w.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (cs *codeSniffer) Unwrap() http.ResponseWriter {
+	return cs.w
 }
 
 func (cs *codeSniffer) WriteHeader(statusCode int) {

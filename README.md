@@ -32,10 +32,10 @@ This repo also provides two library packages
    form itself is plain JavaScript and CSS with no third-party dependencies.
 
 ## Features
-`grpcui` supports all kinds of RPC methods, including streaming methods. However, it requires
-you to construct the entire stream of request messages all at once and then renders the entire
-resulting stream of response messages all at once (so you can't interact with bidirectional
-streams the way that `grpcurl` can).
+`grpcui` supports all kinds of RPC methods, including streaming methods. Streaming calls are
+live: response messages show up as the server sends them, and for client and bidirectional
+streams the call stays open after the first messages are sent, so you can keep sending more
+(edit the form and press Send), then finish sending or cancel the call when you're done.
 
 `grpcui` supports both plain-text and TLS servers and has numerous options for TLS
 configuration. It also supports mutual TLS, where the client is required to present a
@@ -52,6 +52,11 @@ all possible kinds of protobuf messages, including rich support for well-known t
 
 In addition to entering the data via HTML form, you can also enter the data in JSON format,
 by typing or pasting the entire JSON request body into a text form.
+
+Fields start switched on with their default values, except fields declared `optional`. The
+**Fake data** button fills the request with made-up values that fit each field's name: an
+`email` gets an email address, a `created_at` a recent time, a `page_size` a small number, and
+fields it can't guess get a random value of their type.
 
 Upon issuing an RPC, the web UI shows all gRPC response metadata, including both headers and
 trailers sent by the server. And, of course, it shows a human-comprehensible response body, in

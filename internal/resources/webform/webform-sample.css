@@ -1635,6 +1635,58 @@
     margin-top: 12px;
 }
 
+/* ---------- live calls (streaming methods) ---------- */
+
+.grpcui .gu-live-bar {
+    /* stays in view below the panel's sticky header */
+    position: sticky;
+    top: 60px;
+    z-index: 2;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border: 1px solid hsl(var(--border));
+    border-radius: var(--radius);
+    background: hsl(var(--background));
+}
+
+.grpcui .gu-live-dot {
+    display: inline-block;
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: hsl(var(--success));
+    animation: gu-live-pulse 1.4s ease-in-out infinite;
+}
+
+.grpcui .gu-live-badge {
+    gap: 6px;
+}
+
+@keyframes gu-live-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
+.grpcui .gu-live-notices:empty {
+    display: none;
+}
+
+.grpcui .gu-live-notices {
+    margin-bottom: 12px;
+}
+
+.grpcui .gu-live-msg.gu-live-sent .msg-head {
+    background: hsl(var(--muted) / 0.6);
+}
+
+.grpcui .gu-live-msg.gu-live-received .msg-head svg {
+    color: hsl(var(--success));
+}
+
 /* ---------- overlays: tooltip, menu, toast, dialog, sheet ---------- */
 
 .grpcui .tooltip {
@@ -2213,6 +2265,10 @@
         padding: 8px 12px;
         flex-wrap: wrap;
     }
+    .grpcui .gu-live-bar {
+        /* the header's height varies once it wraps */
+        position: static;
+    }
     .grpcui .gu-panel-body {
         padding: 12px 12px 24px;
     }
@@ -2225,6 +2281,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+    .grpcui .gu-live-dot {
+        animation: none;
+    }
     .grpcui *, .grpcui *::before, .grpcui *::after {
         animation-duration: 0.01ms !important;
         transition-duration: 0.01ms !important;

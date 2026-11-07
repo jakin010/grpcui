@@ -25,6 +25,10 @@ const ICONS = {
     "layers": '<path d="m12 2 10 5-10 5L2 7l10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
     "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
     "play": '<path d="M6 3l14 9-14 9V3z"/>',
+    "square": '<rect x="5" y="5" width="14" height="14" rx="2"/>',
+    "arrow-up": '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>',
+    "arrow-down": '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
+    "wand": '<path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/>',
     "history": '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
     "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>',
     "moon": '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
@@ -815,6 +819,9 @@ window.initGRPCForm = function(cfg) {
         inheritOff: false,
     };
 
+    // the running live call of a streaming method, if any (see Live calls)
+    let live = null;
+
     const els = {
         tree: qs("#gu-tree"),
         search: qs("#gu-search"),
@@ -826,6 +833,7 @@ window.initGRPCForm = function(cfg) {
         grpcurl: qs("#gu-grpcurl"),
         timeout: qs("#gu-timeout"),
         invoke: qs("#gu-invoke"),
+        fake: qs("#gu-fake-btn"),
         invokeLabel: qs("#gu-invoke-label"),
         response: qs("#gu-response"),
         respStatus: qs("#gu-resp-status"),
@@ -1317,6 +1325,10 @@ window.initGRPCForm = function(cfg) {
 
     function setInvokeEnabled(on) {
         els.invoke.disabled = !on;
+        els.fake.disabled = !on;
+        if (typeof updateInvokeButton === "function" && live) {
+            updateInvokeButton();
+        }
     }
 
     function persistSelection() {
@@ -1364,6 +1376,9 @@ window.initGRPCForm = function(cfg) {
         renderBreadcrumb();
         renderMethodCard();
         renderMetadataSection();
+        if (changed) {
+            stopLiveCall();
+        }
         resetResponse();
         updateSavedButton();
 
@@ -1407,16 +1422,21 @@ window.initGRPCForm = function(cfg) {
 
     // Fetches JSON. Adds headers from the optional window.grpcui.requestHeaders()
     // hook (the standalone page uses it for the CSRF token).
-    async function api(url, opts) {
-        opts = opts || {};
+    function requestHeaders(url, method, hasBody) {
         const headers = {};
-        if (opts.body !== undefined) {
+        if (hasBody) {
             headers["Content-Type"] = "application/json";
         }
         const hook = window.grpcui && window.grpcui.requestHeaders;
         if (typeof hook === "function") {
-            Object.assign(headers, hook({url: url, method: opts.method || "GET"}) || {});
+            Object.assign(headers, hook({url: url, method: method}) || {});
         }
+        return headers;
+    }
+
+    async function api(url, opts) {
+        opts = opts || {};
+        const headers = requestHeaders(url, opts.method || "GET", opts.body !== undefined);
         let resp;
         try {
             resp = await fetch(url, {
@@ -1883,7 +1903,7 @@ window.initGRPCForm = function(cfg) {
 
     function buildRequestForm(schema) {
         state.schema = schema;
-        let requestObj = getInitialMessageValue(schema.requestType);
+        let requestObj = defaultMessageValue(schema, schema.requestType);
         if (schema.requestStream) {
             requestObj = [requestObj];
         }
@@ -3333,7 +3353,7 @@ window.initGRPCForm = function(cfg) {
             if (wellKnown) {
                 input.anyValue = value["value"];
                 if (isUnset(input.anyValue)) {
-                    input.anyValue = getInitialMessageValue(typeName);
+                    input.anyValue = defaultMessageValue(schema, typeName);
                     value["value"] = input.anyValue;
                 }
             } else {
@@ -3485,7 +3505,7 @@ window.initGRPCForm = function(cfg) {
             return [];
         }
         if (fld.isMessage) {
-            return getInitialMessageValue(fld.type);
+            return defaultMessageValue(schema, fld.type);
         }
         if (!isUnset(fld.defaultVal)) {
             return fld.defaultVal;
@@ -3505,6 +3525,508 @@ window.initGRPCForm = function(cfg) {
                 return false;
             default:
                 throw new Error("unknown non-message non-enum type: " + fld.type);
+        }
+    }
+
+    // The starting value of a message: every field that isn't declared
+    // optional is switched on with its default value. Oneofs and Any fields
+    // stay unset (they need a choice), and a message type already being
+    // filled further up is left out, so recursive types end.
+    function defaultMessageValue(schema, type, seen) {
+        const messageTypes = schema && schema.messageTypes;
+        if (isWellKnown(type) || !messageTypes || !messageTypes[type]) {
+            return getInitialMessageValue(type);
+        }
+        seen = seen || new Set();
+        seen.add(type);
+        const out = {};
+        for (const f of messageTypes[type]) {
+            if (isOneOf(f) || f.isOptional || f.type === "google.protobuf.Any") {
+                continue;
+            }
+            if (f.isMessage && !f.isArray && !f.isMap) {
+                if (!seen.has(f.type)) {
+                    out[f.name] = defaultMessageValue(schema, f.type, seen);
+                }
+            } else {
+                out[f.name] = getInitialValue(schema, f);
+            }
+        }
+        seen.delete(type);
+        return out;
+    }
+
+    // ---------------------------------------------------------------------
+    // Fake data
+    //
+    // Fills a request with made-up values. Each field's name (and type) hints
+    // at what it holds: an "email" gets an email address, a "created_at" a
+    // recent time, a "page_size" a small number. Fields it can't guess get a
+    // random value of their type. Optional fields are only filled when they
+    // are already switched on.
+    // ---------------------------------------------------------------------
+
+    const fake = (function() {
+        const FIRST = ["Ada", "Grace", "Alan", "Linus", "Margaret", "Ken", "Barbara", "Dennis", "Radia", "Tim", "Katherine", "Guido", "Frances", "Edsger", "Hedy", "Niklaus"];
+        const LAST = ["Lovelace", "Hopper", "Turing", "Torvalds", "Hamilton", "Thompson", "Liskov", "Ritchie", "Perlman", "Lee", "Johnson", "Rossum", "Allen", "Dijkstra", "Lamarr", "Wirth"];
+        const WORDS = ["alpha", "bravo", "cedar", "delta", "ember", "falcon", "garnet", "harbor", "indigo", "juniper", "kestrel", "lumen", "maple", "nimbus", "orbit", "pebble", "quartz", "river", "summit", "tundra", "umber", "velvet", "willow", "zephyr"];
+        const SENTENCES = [
+            "Quick check that everything works end to end.",
+            "Requested by the support team after the last release.",
+            "This is a sample value generated by gRPC UI.",
+            "Please ship this before the end of the week.",
+            "Follow up with the customer about the delayed order.",
+            "Imported from the nightly batch job.",
+        ];
+        const PLACES = [
+            {city: "San Francisco", region: "CA", country: "United States", code: "US", zip: "94103", tz: "America/Los_Angeles"},
+            {city: "New York", region: "NY", country: "United States", code: "US", zip: "10001", tz: "America/New_York"},
+            {city: "London", region: "England", country: "United Kingdom", code: "GB", zip: "EC1A 1BB", tz: "Europe/London"},
+            {city: "Berlin", region: "Berlin", country: "Germany", code: "DE", zip: "10115", tz: "Europe/Berlin"},
+            {city: "Tokyo", region: "Tokyo", country: "Japan", code: "JP", zip: "100-0001", tz: "Asia/Tokyo"},
+            {city: "Toronto", region: "ON", country: "Canada", code: "CA", zip: "M5H 2N2", tz: "America/Toronto"},
+            {city: "Sydney", region: "NSW", country: "Australia", code: "AU", zip: "2000", tz: "Australia/Sydney"},
+        ];
+        const STREETS = ["Main St", "Oak Ave", "Market St", "Elm St", "Park Rd", "High St", "Maple Dr", "Lake View Blvd"];
+        const COMPANIES = ["Blue Harbor Labs", "Cedar & Co", "Summit Analytics", "Nimbus Systems", "Orbit Logistics", "Juniper Health"];
+        const ROLES = ["Software Engineer", "Product Manager", "Designer", "Data Analyst", "Support Lead", "Account Executive"];
+        const STATUSES = ["active", "pending", "completed", "archived"];
+        const COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#14b8a6"];
+        const CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CAD"];
+        const LOCALES = ["en-US", "en-GB", "de-DE", "fr-FR", "ja-JP", "es-ES"];
+        const PERSONISH = /user|person|customer|author|owner|member|contact|employee|account|profile|player|patient|student|actor|people|recipient|sender/i;
+        const PLACEHOLDER_ENUM = /(^|_)(UNSPECIFIED|UNKNOWN|INVALID|UNSET|NONE|DEFAULT)$/i;
+
+        const rand = n => Math.floor(Math.random() * n);
+        const pick = a => a[rand(a.length)];
+        const between = (lo, hi) => lo + rand(hi - lo + 1);
+        const cap = w => w.charAt(0).toUpperCase() + w.slice(1);
+        const hex = n => Array.from({length: n}, () => "0123456789abcdef"[rand(16)]).join("");
+        const uuid = () => hex(8) + "-" + hex(4) + "-4" + hex(3) + "-" + "89ab"[rand(4)] + hex(3) + "-" + hex(12);
+        const words = n => Array.from({length: n}, () => pick(WORDS));
+        const base64 = n => btoa(String.fromCharCode(...Array.from({length: n}, () => rand(256))));
+        const DAY = 86400 * 1000;
+
+        // the field's name as snake_case words, e.g. "createdAt" -> "created_at"
+        function norm(name) {
+            return String(name || "").replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase().replace(/^_|_$/g, "");
+        }
+
+        // a person and a place per message, so a message's fields agree with
+        // each other (the email matches the name, the city the country)
+        function newContext(typeName, fields) {
+            const first = pick(FIRST);
+            const last = pick(LAST);
+            return {
+                typeName: typeName || "",
+                names: new Set((fields || []).map(f => norm(f.protoName || f.name))),
+                first: first,
+                last: last,
+                place: pick(PLACES),
+                user: (first + "." + last).toLowerCase(),
+            };
+        }
+
+        function timeMS(n) {
+            if (/expir|until|deadline|due|ends?_|_end|valid_to|not_after/.test(n)) {
+                return Date.now() + between(1, 60) * DAY;
+            }
+            if (/birth|dob/.test(n)) {
+                return Date.UTC(between(1960, 2004), rand(12), between(1, 28));
+            }
+            return Date.now() - rand(30 * DAY);
+        }
+
+        const isTimeName = n => /(^|_)(at|on|time|timestamp|date|datetime|ts|epoch|since|until|deadline|birthday|dob)$|^(created|updated|modified|deleted|expires?|started|ended|last_seen|last_login)/.test(n);
+
+        function fakeString(n, ctx) {
+            const last = n.split("_").pop();
+            if (/(^|_)e?mail(_address)?$/.test(n)) {
+                return ctx.user + "@example.com";
+            }
+            if (/phone|mobile|(^|_)tel$|telephone|fax/.test(n)) {
+                return "+1-555-01" + String(rand(100)).padStart(2, "0");
+            }
+            if (/(^|_)(first|given)_?name$|forename|middle_name/.test(n)) {
+                return ctx.first;
+            }
+            if (/(^|_)(last|family)_?name$|surname/.test(n)) {
+                return ctx.last;
+            }
+            if (/(^|_)(full|display|real|legal|contact)_name$/.test(n) || (n === "name" && PERSONISH.test(ctx.typeName))) {
+                return ctx.first + " " + ctx.last;
+            }
+            if (/user_?name|(^|_)login$|handle|nick_?name|screen_name|(^|_)alias$/.test(n)) {
+                return ctx.user.replace(".", "_") + rand(100);
+            }
+            if (/password|passwd|passphrase|(^|_)pin$/.test(n)) {
+                return cap(pick(WORDS)) + "-" + pick(WORDS) + "-" + between(100, 999) + "!";
+            }
+            if (/token|api_key|access_key|secret|signature|nonce|(^|_)key$/.test(n)) {
+                return /page_token|cursor/.test(n) ? base64(12) : hex(32);
+            }
+            if (/uuid|guid/.test(n) || last === "id" || last === "ids") {
+                return uuid();
+            }
+            if (/image|avatar|photo|picture|icon|thumbnail|logo/.test(n)) {
+                return "https://example.com/images/" + pick(WORDS) + ".png";
+            }
+            if (/url|uri|link|href|website|homepage|endpoint|callback/.test(n)) {
+                return "https://example.com/" + words(2).join("/");
+            }
+            if (/domain|hostname|(^|_)host$/.test(n)) {
+                return pick(WORDS) + ".example.com";
+            }
+            if (/ipv6/.test(n)) {
+                return "2001:db8::" + hex(4);
+            }
+            if (/(^|_)ip(_address|v4)?$|ip_addr/.test(n)) {
+                return "192.0.2." + between(1, 254);
+            }
+            if (/mac_address/.test(n)) {
+                return Array.from({length: 6}, () => hex(2)).join(":");
+            }
+            if (/street|address_line|line_?1|line_?2|(^|_)address$/.test(n)) {
+                return between(1, 999) + " " + pick(STREETS);
+            }
+            if (/city|town|locality/.test(n)) {
+                return ctx.place.city;
+            }
+            if (/province|region|county/.test(n) || (/(^|_)state$/.test(n) && (ctx.names.has("city") || /address|location|place/i.test(ctx.typeName)))) {
+                return ctx.place.region;
+            }
+            if (/country_code|country_iso|(^|_)country$/.test(n) && /code|iso/.test(n)) {
+                return ctx.place.code;
+            }
+            if (/country|nation/.test(n)) {
+                return ctx.place.country;
+            }
+            if (/zip|postal|post_code|postcode/.test(n)) {
+                return ctx.place.zip;
+            }
+            if (/time_?zone|(^|_)tz$/.test(n)) {
+                return ctx.place.tz;
+            }
+            if (/locale|(^|_)lang(uage)?(_code)?$/.test(n)) {
+                return pick(LOCALES);
+            }
+            if (/currency/.test(n)) {
+                return pick(CURRENCIES);
+            }
+            if (/colou?r/.test(n)) {
+                return pick(COLORS);
+            }
+            if (/company|organi[sz]ation|(^|_)org(_name)?$|employer|business|vendor|merchant|brand/.test(n)) {
+                return pick(COMPANIES);
+            }
+            if (/job_title|position|occupation|(^|_)role$/.test(n)) {
+                return pick(ROLES);
+            }
+            if (isTimeName(n)) {
+                const iso = new Date(timeMS(n)).toISOString();
+                return /(^|_)date$|birth|dob/.test(n) ? iso.slice(0, 10) : iso.replace(/\.\d+Z$/, "Z");
+            }
+            if (/title|subject|headline|caption|(^|_)heading$/.test(n)) {
+                return words(between(2, 4)).map(cap).join(" ");
+            }
+            if (/description|summary|bio|about|comment|note|body|text|message|content|details|reason|instructions|feedback|review/.test(n)) {
+                return pick(SENTENCES);
+            }
+            if (/slug|permalink/.test(n)) {
+                return words(3).join("-");
+            }
+            if (/file_?name/.test(n)) {
+                return pick(WORDS) + "." + pick(["pdf", "png", "csv", "json", "txt"]);
+            }
+            if (/(^|_)(path|dir|directory|folder)$/.test(n)) {
+                return "/var/data/" + words(2).join("/");
+            }
+            if (/mime|content_type|media_type/.test(n)) {
+                return pick(["application/json", "text/plain", "image/png"]);
+            }
+            if (/version/.test(n)) {
+                return between(0, 3) + "." + between(0, 20) + "." + between(0, 9);
+            }
+            if (/status|(^|_)state$/.test(n)) {
+                return pick(STATUSES);
+            }
+            if (/hash|checksum|(^|_)sha|md5|digest|etag|fingerprint/.test(n)) {
+                return hex(40);
+            }
+            if (/sku/.test(n)) {
+                return "SKU-" + between(10000, 99999);
+            }
+            if (/(^|_)code$|coupon|promo|voucher/.test(n)) {
+                return Array.from({length: 6}, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[rand(32)]).join("");
+            }
+            if (/query|search|keyword|(^|_)term$|(^|_)q$/.test(n)) {
+                return pick(WORDS);
+            }
+            if (/(^|_)(type|kind|category|tag|tags|topic|group|channel|label)$/.test(n)) {
+                return pick(WORDS);
+            }
+            if (last === "name" || n === "name") {
+                return words(2).map(cap).join(" ");
+            }
+            // no idea: a random value
+            return pick(WORDS) + "-" + between(1000, 9999);
+        }
+
+        // a number for the field, as a JS number (or null if the name gives
+        // no hint)
+        function numberHint(n, isFloat) {
+            if (/(^|_)lat(itude)?$/.test(n)) {
+                return +(Math.random() * 180 - 90).toFixed(6);
+            }
+            if (/(^|_)(lng|lon|long|longitude)$/.test(n)) {
+                return +(Math.random() * 360 - 180).toFixed(6);
+            }
+            if (/(^|_)age$/.test(n)) {
+                return between(18, 80);
+            }
+            if (/(^|_)year$/.test(n)) {
+                return between(1990, new Date().getFullYear());
+            }
+            if (/(^|_)month$/.test(n)) {
+                return between(1, 12);
+            }
+            if (/(^|_)day$/.test(n)) {
+                return between(1, 28);
+            }
+            if (/(^|_)hours?$/.test(n)) {
+                return between(0, 23);
+            }
+            if (/(^|_)(minutes?|seconds?)$/.test(n)) {
+                return between(0, 59);
+            }
+            if (/(^|_)port$/.test(n)) {
+                return between(1024, 65535);
+            }
+            if (/page_size|per_page|(^|_)limit$|max_results|batch_size|(^|_)size$/.test(n)) {
+                return pick([10, 20, 25, 50]);
+            }
+            if (/(^|_)page(_number|_num)?$/.test(n)) {
+                return between(1, 5);
+            }
+            if (/offset|(^|_)skip$/.test(n)) {
+                return between(0, 10) * 10;
+            }
+            if (/percent|pct/.test(n)) {
+                return isFloat ? +(Math.random() * 100).toFixed(1) : between(0, 100);
+            }
+            if (/ratio|(^|_)rate$|probability|weight|confidence/.test(n)) {
+                return isFloat ? +Math.random().toFixed(3) : between(0, 100);
+            }
+            if (/score|rating|stars/.test(n)) {
+                return isFloat ? +(1 + Math.random() * 4).toFixed(1) : between(1, 5);
+            }
+            if (/price|amount|cost|total|balance|fee|salary|subtotal|tax|revenue|budget/.test(n)) {
+                // integer amounts are usually cents (or micros)
+                return isFloat ? +(1 + Math.random() * 999).toFixed(2) : between(100, 99999);
+            }
+            if (/count|quantity|(^|_)qty$|(^|_)num(_|$)|number_of|(^|_)n$|retries|attempts/.test(n)) {
+                return between(1, 10);
+            }
+            if (/duration|timeout|ttl|interval|delay|elapsed|latency/.test(n)) {
+                return /ms$|millis/.test(n) ? between(50, 5000) : between(1, 3600);
+            }
+            if (isTimeName(n)) {
+                const ms = timeMS(n);
+                return /ms$|millis/.test(n) ? ms : Math.floor(ms / 1000);
+            }
+            if (/(^|_)id$|_ids?$/.test(n)) {
+                return between(1, 100000);
+            }
+            return null;
+        }
+
+        const intRange = t => t === "uint32" || t === "fixed32" ? [0, MAX_UINT32] : [MIN_INT32, MAX_INT32];
+
+        function fakeScalar(schema, f, ctx) {
+            const n = norm(f.protoName || f.name);
+            if (f.isEnum) {
+                const vals = (schema.enumTypes[f.type] || []);
+                const real = vals.filter(v => !PLACEHOLDER_ENUM.test(v.name));
+                const choices = real.length ? real : vals;
+                return choices.length ? pick(choices).name : getInitialValue(schema, f);
+            }
+            switch (f.type) {
+                case "string": case "google.protobuf.StringValue":
+                    return fakeString(n, ctx);
+                case "bytes": case "google.protobuf.BytesValue":
+                    return base64(/hash|sha|digest|key|signature/.test(n) ? 32 : between(8, 16));
+                case "bool": case "google.protobuf.BoolValue":
+                    return Math.random() < 0.5;
+                case "double": case "float": case "google.protobuf.DoubleValue": case "google.protobuf.FloatValue": {
+                    const v = numberHint(n, true);
+                    return v !== null ? v : +(Math.random() * 1000).toFixed(2);
+                }
+                case "int64": case "sint64": case "sfixed64": case "google.protobuf.Int64Value":
+                case "uint64": case "fixed64": case "google.protobuf.UInt64Value": {
+                    let v = numberHint(n, false);
+                    if (v === null) {
+                        v = between(1, 100000);
+                    }
+                    if (/uint|fixed64/.test(f.type) && !/sfixed/.test(f.type)) {
+                        v = Math.abs(v);
+                    }
+                    return String(Math.round(v));
+                }
+                case "google.protobuf.Int32Value": case "google.protobuf.UInt32Value":
+                case "int32": case "sint32": case "sfixed32": case "uint32": case "fixed32": {
+                    const t = f.type === "google.protobuf.Int32Value" ? "int32" : f.type === "google.protobuf.UInt32Value" ? "uint32" : f.type;
+                    const [lo, hi] = intRange(t);
+                    let v = numberHint(n, false);
+                    if (v === null) {
+                        v = between(1, 1000);
+                    }
+                    if (v > hi && isTimeName(n)) {
+                        // milliseconds don't fit: use seconds
+                        v = Math.floor(v / 1000);
+                    }
+                    return Math.max(lo, Math.min(hi, Math.round(v)));
+                }
+                case "google.protobuf.Timestamp":
+                    return new Date(timeMS(n)).toISOString().replace(/\.\d+Z$/, "Z");
+                case "google.protobuf.Duration": {
+                    const v = numberHint(n, false);
+                    return (v !== null && v > 0 && v < 1e6 ? Math.round(/ms$|millis/.test(n) ? v / 1000 : v) || 1 : between(1, 3600)) + "s";
+                }
+                case "google.protobuf.Value":
+                    return fakeString(n, ctx);
+                case "google.protobuf.Struct": {
+                    const obj = {};
+                    obj[pick(WORDS)] = pick(WORDS);
+                    obj.count = between(1, 10);
+                    return obj;
+                }
+                default:
+                    return getInitialValue(schema, f);
+            }
+        }
+
+        // a fake value for field f; cur is the field's current value
+        function fakeField(schema, f, cur, seen, depth) {
+            if (f.isMap) {
+                const entry = schema.messageTypes[f.type] || [];
+                const out = {};
+                const keys = cur && typeof cur === "object" ? Object.keys(cur) : [];
+                const count = keys.length || between(1, 2);
+                const ctx = newContext(f.type, entry);
+                for (let i = 0; i < count; i++) {
+                    let k = keys[i];
+                    if (k === undefined && entry[0]) {
+                        // name the key after the map field ("labels" -> a label)
+                        const kf = Object.assign({}, entry[0], {protoName: (f.protoName || f.name).replace(/s$/, "")});
+                        k = String(fakeScalar(schema, kf, ctx));
+                        if (Object.prototype.hasOwnProperty.call(out, k)) {
+                            k = k + "_" + i;
+                        }
+                    }
+                    const vf = Object.assign({}, entry[1], {protoName: (f.protoName || f.name).replace(/s$/, "")});
+                    out[k] = entry[1] ? fakeField(schema, vf, cur && cur[k], seen, depth + 1) : "";
+                }
+                return out;
+            }
+            if (f.isArray) {
+                const elem = Object.assign({}, f, {isArray: false, protoName: (f.protoName || f.name).replace(/(ies)$/, "y").replace(/([^s])s$/, "$1")});
+                if (elem.type === "google.protobuf.Any" || (elem.isMessage && !isWellKnown(elem.type) && (seen.has(elem.type) || depth > 5))) {
+                    // an Any needs its type picked by hand
+                    return Array.isArray(cur) ? cur : [];
+                }
+                const items = Array.isArray(cur) && cur.length ? cur : new Array(between(1, 3)).fill(undefined);
+                return items.map(c => fakeField(schema, elem, c, seen, depth + 1)).filter(v => v !== undefined);
+            }
+            if (f.type === "google.protobuf.ListValue") {
+                return words(between(1, 3));
+            }
+            if (f.type === "google.protobuf.Any") {
+                return cur;
+            }
+            if (f.isMessage && !isWellKnown(f.type)) {
+                return fakeMessage(schema, f.type, cur, seen, depth + 1);
+            }
+            return fakeScalar(schema, f, f.ctx || newContext("", []));
+        }
+
+        function fakeMessage(schema, type, cur, seen, depth) {
+            const fields = schema.messageTypes[type];
+            if (!fields) {
+                return isWellKnown(type) ? fakeScalar(schema, {name: "", type: type}, newContext("", [])) : (cur || {});
+            }
+            cur = cur && typeof cur === "object" && !Array.isArray(cur) ? cur : {};
+            seen = seen || new Set();
+            seen.add(type);
+            const ctx = newContext(type, fields);
+            const out = {};
+            const has = k => !isUnset(cur[k]);
+            for (const f of fields) {
+                if (isOneOf(f)) {
+                    let choice = f.oneOfFields.find(c => has(c.name));
+                    if (!choice && !f.isOptional) {
+                        const ok = f.oneOfFields.filter(c => !(c.isMessage && seen.has(c.type)) && c.type !== "google.protobuf.Any");
+                        choice = ok.length ? pick(ok) : undefined;
+                    }
+                    if (choice) {
+                        out[choice.name] = fakeField(schema, Object.assign({}, choice, {ctx: ctx}), cur[choice.name], seen, depth);
+                    }
+                    continue;
+                }
+                if (f.isOptional && !has(f.name)) {
+                    continue;
+                }
+                if (f.isMessage && !f.isArray && !f.isMap && !isWellKnown(f.type) && !has(f.name) && (seen.has(f.type) || depth > 5)) {
+                    // a recursive field that's off stays off
+                    continue;
+                }
+                const v = fakeField(schema, Object.assign({}, f, {ctx: ctx}), cur[f.name], seen, depth);
+                if (v !== undefined) {
+                    out[f.name] = v;
+                }
+            }
+            seen.delete(type);
+            return out;
+        }
+
+        return {
+            // a fake request for the schema, based on the current one
+            request: function(schema, current) {
+                if (schema.requestStream) {
+                    const items = Array.isArray(current) && current.length ? current : [undefined];
+                    return items.map(c => fakeMessage(schema, schema.requestType, c, new Set(), 0));
+                }
+                if (isWellKnown(schema.requestType)) {
+                    return fakeScalar(schema, {name: "", type: schema.requestType}, newContext("", []));
+                }
+                return fakeMessage(schema, schema.requestType, current, new Set(), 0);
+            },
+        };
+    })();
+
+    function fillWithFakeData() {
+        if (!state.schemaReady || !state.schema) {
+            return;
+        }
+        if (!onlyIfValid()) {
+            return;
+        }
+        let req;
+        try {
+            req = fake.request(state.schema, state.request);
+        } catch (e) {
+            if (debug) {
+                console.trace(e);
+            }
+            toast("Couldn't make fake data", {variant: "error", description: e.message});
+            return;
+        }
+        updateJSONRequest(req);
+        try {
+            validateJSON();
+        } catch (e) {
+            markInvalid(els.raw, e.message);
+            reqTabs.select("json", true);
+            toast("The fake data didn't fit the form", {variant: "error", description: e.message});
         }
     }
 
@@ -3856,6 +4378,11 @@ window.initGRPCForm = function(cfg) {
     }
 
     async function invoke() {
+        if (live) {
+            // while a live call runs, Invoke sends the form's messages on it
+            liveSend();
+            return;
+        }
         if (state.invoking || !state.schemaReady || !state.service) {
             return;
         }
@@ -3884,6 +4411,12 @@ window.initGRPCForm = function(cfg) {
             method: method,
             startTime: new Date().toISOString(),
         };
+
+        const mi = methodInfo(service, method);
+        if (streamKind(mi)) {
+            invokeLive({service, method, mi, timeout, metadata, data, original, historyItem});
+            return;
+        }
 
         setInvoking(true);
         showResponseLoading();
@@ -3993,7 +4526,378 @@ window.initGRPCForm = function(cfg) {
         return result;
     }
 
+
+    // ---------------------------------------------------------------------
+    // Live calls
+    //
+    // Streaming methods run as live calls (see streams.go): responses show up
+    // as they arrive, and for client and bidirectional streams the call stays
+    // open so more messages can be sent. Send (or Invoke) sends the request
+    // form's messages; Finish sending half-closes the call.
+    // ---------------------------------------------------------------------
+
+    function liveURL(call, op) {
+        return call.url + "?op=" + op + (call.id ? "&id=" + encodeURIComponent(call.id) : "");
+    }
+
+    function canSend(call) {
+        return !!call && !call.ended && call.mi.clientStream && !call.halfClosed;
+    }
+
+    function updateInvokeButton() {
+        const call = live;
+        if (!call) {
+            els.invokeLabel.textContent = "Invoke";
+            els.invoke.disabled = state.invoking || !state.schemaReady;
+            return;
+        }
+        if (canSend(call)) {
+            els.invokeLabel.textContent = call.sending ? "Sending…" : "Send";
+            els.invoke.disabled = !call.id || call.sending || !state.schemaReady;
+        } else {
+            els.invokeLabel.textContent = "Receiving…";
+            els.invoke.disabled = true;
+        }
+        if (call.view) {
+            const v = call.view;
+            v.send.hidden = v.finish.hidden = !call.mi.clientStream || call.halfClosed;
+            v.send.disabled = els.invoke.disabled;
+            v.finish.disabled = !call.id;
+            v.hint.textContent = canSend(call)
+                ? "The call is open. Send sends the form's messages again."
+                : call.mi.clientStream ? "Sending is finished. Waiting for the server to end the call." : "Receiving messages as the server sends them.";
+        }
+    }
+
+    function scrollParent(el) {
+        for (let p = el.parentElement; p; p = p.parentElement) {
+            const o = getComputedStyle(p).overflowY;
+            if (o === "auto" || o === "scroll") {
+                return p;
+            }
+        }
+        return document.scrollingElement;
+    }
+
+    function buildLiveView(call) {
+        const send = h("button", {type: "button", class: "btn btn-primary btn-xs"}, icon("send", 13), "Send");
+        const finish = h("button", {type: "button", class: "btn btn-outline btn-xs"}, icon("check", 13), "Finish sending");
+        const cancel = h("button", {type: "button", class: "btn btn-ghost btn-xs"}, icon("square", 12), "Cancel");
+        send.addEventListener("click", () => liveSend());
+        finish.addEventListener("click", () => liveFinish());
+        cancel.addEventListener("click", () => liveCancel());
+        const hint = h("span", {class: "muted text-sm"});
+        const controls = h("div", {class: "gu-live-bar"}, h("span", {class: "gu-live-dot", "aria-hidden": "true"}), hint, h("div", {class: "gu-spacer"}), send, finish, cancel);
+
+        const headersCount = h("span", {class: "tab-count", text: "0"});
+        const trailersCount = h("span", {class: "tab-count", text: "0"});
+        const tabList = h("div", {class: "tabs-list", role: "tablist", "aria-label": "Response view"},
+            h("button", {type: "button", role: "tab", class: "tab", dataset: {tab: "body"}, "aria-selected": "false"}, "Messages"),
+            h("button", {type: "button", role: "tab", class: "tab", dataset: {tab: "headers"}, "aria-selected": "false"}, "Headers", headersCount),
+            h("button", {type: "button", role: "tab", class: "tab", dataset: {tab: "trailers"}, "aria-selected": "false"}, "Trailers", trailersCount));
+        qs('[data-tab="' + respTab + '"]', tabList).setAttribute("aria-selected", "true");
+        const notices = h("div", {class: "gu-live-notices"});
+        const timeline = h("div", {class: "gu-live-timeline", "aria-live": "polite"});
+        const bodyPanel = h("div", {dataset: {panel: "body"}, role: "tabpanel"}, notices, timeline);
+        const headersPanel = h("div", {dataset: {panel: "headers"}, role: "tabpanel"}, kvTable([], "No response headers yet."));
+        const trailersPanel = h("div", {dataset: {panel: "trailers"}, role: "tabpanel"}, kvTable([], "Trailers arrive when the call ends."));
+        const panels = h("div", null, bodyPanel, headersPanel, trailersPanel);
+
+        els.respCopy.hidden = true;
+        lastResponseText = "";
+        els.response.replaceChildren(controls, tabList, panels);
+        createTabs(tabList, panels, {onChange: name => respTab = name});
+        call.view = {controls, send, finish, cancel, hint, timeline, notices, headersPanel, trailersPanel, headersCount, trailersCount};
+        updateLiveStatus(call);
+        updateInvokeButton();
+    }
+
+    function updateLiveStatus(call) {
+        if (!call.visible) {
+            return;
+        }
+        const counts = call.sentCount + " sent · " + call.received.length + " received";
+        let badge;
+        if (!call.ended) {
+            badge = h("span", {class: "badge badge-outline gu-live-badge"}, h("span", {class: "gu-live-dot"}), call.id ? "Live" : "Opening");
+        } else if (call.failure) {
+            badge = h("span", {class: "badge badge-destructive", text: call.failure.status ? "HTTP " + call.failure.status : "Failed"});
+        } else if (call.error) {
+            badge = h("span", {class: "badge badge-destructive", "data-tooltip": "gRPC status code " + call.error.code, text: call.error.name});
+        } else {
+            badge = h("span", {class: "badge badge-success", text: "OK"});
+        }
+        const parts = [counts];
+        if (call.ended) {
+            parts.unshift(formatDuration(call.durationMS));
+        }
+        els.respStatus.replaceChildren(badge, h("span", {class: "gu-resp-meta", text: parts.join(" · ")}));
+    }
+
+    function appendLiveMessage(call, dir, n, ms, block, isError) {
+        if (!call.visible) {
+            return;
+        }
+        const tl = call.view.timeline;
+        const sc = scrollParent(tl);
+        const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 48;
+        tl.appendChild(h("div", {class: "msg-card gu-live-msg gu-live-" + dir},
+            h("div", {class: "msg-head"},
+                icon(dir === "sent" ? "arrow-up" : "arrow-down", 13),
+                h("span", {text: (dir === "sent" ? "Sent " : "Received ") + n}),
+                isError ? h("span", {class: "badge badge-destructive", text: "error"}) : null,
+                h("span", {class: "gu-spacer"}),
+                h("span", {class: "mono", "data-tooltip": "Time since the call started", text: "+" + formatDuration(ms)})),
+            block));
+        if (atBottom) {
+            sc.scrollTop = sc.scrollHeight;
+        }
+    }
+
+    function updateLiveCopy(call) {
+        const bodies = call.received.filter(m => !m.isError).map(m => m.message);
+        lastResponseText = JSON.stringify(bodies.length === 1 && !call.mi.serverStream ? bodies[0] : bodies, null, 2);
+        if (call.visible) {
+            els.respCopy.hidden = bodies.length === 0;
+        }
+    }
+
+    function onLiveEvent(call, ev) {
+        switch (ev.type) {
+            case "open":
+                call.id = ev.id;
+                break;
+            case "headers":
+                call.headers = ev.headers || [];
+                if (call.visible) {
+                    call.view.headersPanel.replaceChildren(kvTable(call.headers, "No response headers."));
+                    call.view.headersCount.textContent = String(call.headers.length);
+                }
+                break;
+            case "sent":
+                while (call.sentCount < ev.sent) {
+                    call.sentCount++;
+                    const m = call.pending.shift();
+                    appendLiveMessage(call, "sent", call.sentCount, ev.elapsedMS, codeBlock(m === undefined ? {} : m), false);
+                }
+                break;
+            case "message":
+                call.received.push({message: ev.message, isError: !!ev.isError});
+                appendLiveMessage(call, "received", call.received.length, ev.elapsedMS,
+                    messageBlock({message: ev.message, isError: !!ev.isError}, call.received.length - 1), !!ev.isError);
+                updateLiveCopy(call);
+                break;
+            case "end":
+                call.error = ev.error || null;
+                call.trailers = ev.trailers || [];
+                call.requests = ev.requests || null;
+                endLiveCall(call);
+                return;
+            case "failure":
+                endLiveCall(call, {message: ev.text || "The call failed."});
+                return;
+        }
+        updateLiveStatus(call);
+        updateInvokeButton();
+    }
+
+    function endLiveCall(call, failure) {
+        if (call.ended) {
+            return;
+        }
+        call.ended = true;
+        call.failure = failure || null;
+        call.durationMS = performance.now() - call.start;
+        if (live === call) {
+            live = null;
+        }
+        if (call.visible) {
+            const v = call.view;
+            v.controls.remove();
+            v.trailersPanel.replaceChildren(kvTable(call.trailers || [], "No response trailers."));
+            v.trailersCount.textContent = String((call.trailers || []).length);
+            if (failure) {
+                v.notices.appendChild(h("div", {class: "resp-section"}, alertBox("destructive", "The request didn't go through", failure.message)));
+            }
+            if (call.requests && call.requests.total !== call.requests.sent) {
+                v.notices.appendChild(h("div", {class: "resp-section"}, alertBox("warning",
+                    "Only " + call.requests.sent + " of " + call.requests.total + " request messages were accepted",
+                    "The server ended the call before the client finished sending.")));
+            }
+            const err = call.error;
+            if (err) {
+                const box = alertBox("destructive", err.name + " (code " + err.code + ")", err.message !== err.name ? err.message : "");
+                const details = err.details || [];
+                if (details.length) {
+                    const body = qs(".alert-body", box);
+                    body.appendChild(h("div", {class: "alert-title", style: {marginTop: "6px"}, text: "Details"}));
+                    details.forEach(d => body.appendChild(codeBlock(d.message)));
+                }
+                v.notices.appendChild(h("div", {class: "resp-section"}, box));
+            }
+            if (!failure && !err && call.received.length === 0) {
+                v.timeline.appendChild(h("p", {class: "muted text-sm", text: "The server sent no response messages."}));
+            }
+            updateLiveStatus(call);
+        }
+        updateInvokeButton();
+
+        const item = call.historyItem;
+        item.request.data = JSON.parse(JSON.stringify(call.mi.clientStream ? call.sentAll : call.original));
+        item.durationMS = call.durationMS;
+        if (failure) {
+            item.failureStatus = failure.status ? "HTTP " + failure.status : "network error";
+        } else {
+            item.responseData = historyResponseData({error: call.error, responses: call.received});
+        }
+        addHistory(item);
+    }
+
+    async function invokeLive(ctx) {
+        const url = invokeURI + "/" + ctx.service + "." + ctx.method;
+        const call = {
+            url: url, mi: ctx.mi, id: null, visible: true,
+            ended: false, halfClosed: !ctx.mi.clientStream, sending: false,
+            pending: ctx.data.slice(), sentAll: ctx.data.slice(), original: ctx.original,
+            sentCount: 0, received: [], headers: [], trailers: [],
+            start: performance.now(), historyItem: ctx.historyItem,
+            abort: new AbortController(), view: null,
+        };
+        live = call;
+        buildLiveView(call);
+
+        let resp;
+        try {
+            resp = await fetch(liveURL(call, "open"), {
+                method: "POST",
+                headers: requestHeaders(url, "POST", true),
+                body: JSON.stringify({timeout_seconds: ctx.timeout, metadata: ctx.metadata, data: ctx.data}),
+                credentials: "same-origin",
+                signal: call.abort.signal,
+            });
+        } catch (e) {
+            endLiveCall(call, call.cancelled
+                ? {message: "The call was cancelled before it started."}
+                : {message: "Couldn't reach the gRPC UI server. Check that it's still running.", status: 0});
+            return;
+        }
+        if (!resp.ok) {
+            const text = (await resp.text().catch(() => "")).trim();
+            endLiveCall(call, {message: text || resp.statusText || ("HTTP " + resp.status), status: resp.status});
+            return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        try {
+            for (;;) {
+                const {value, done} = await reader.read();
+                if (done) {
+                    break;
+                }
+                buf += decoder.decode(value, {stream: true});
+                let nl;
+                while ((nl = buf.indexOf("\n")) >= 0) {
+                    const line = buf.slice(0, nl);
+                    buf = buf.slice(nl + 1);
+                    if (line.trim()) {
+                        onLiveEvent(call, JSON.parse(line));
+                    }
+                }
+            }
+        } catch (e) {
+            if (debug) {
+                console.trace(e);
+            }
+            endLiveCall(call, {message: call.cancelled ? "The call was cancelled." : "Lost the connection to the gRPC UI server."});
+            return;
+        }
+        endLiveCall(call, {message: "The call ended without a status from the server."});
+    }
+
+    async function liveOp(call, op, body) {
+        return api(liveURL(call, op), {method: "POST", body: body || {}});
+    }
+
+    async function liveSend() {
+        const call = live;
+        if (!canSend(call) || !call.id || call.sending || !state.schemaReady) {
+            return;
+        }
+        if (!onlyIfValid()) {
+            return;
+        }
+        const req = state.request;
+        const data = JSON.parse(JSON.stringify(Array.isArray(req) ? req : [req]));
+        if (data.length === 0) {
+            toast("Nothing to send", {description: "Add a message to the request form first."});
+            return;
+        }
+        call.sending = true;
+        // queue them before asking, since "sent" events can arrive before
+        // the send request returns
+        call.pending.push(...data);
+        call.sentAll.push(...data);
+        updateInvokeButton();
+        try {
+            await liveOp(call, "send", {data: data});
+        } catch (e) {
+            call.pending.splice(call.pending.length - data.length, data.length);
+            call.sentAll.splice(call.sentAll.length - data.length, data.length);
+            toast("Couldn't send", {variant: "error", description: e.message});
+        } finally {
+            call.sending = false;
+            updateInvokeButton();
+        }
+    }
+
+    async function liveFinish() {
+        const call = live;
+        if (!canSend(call) || !call.id) {
+            return;
+        }
+        call.halfClosed = true;
+        updateInvokeButton();
+        try {
+            await liveOp(call, "close");
+        } catch (e) {
+            if (!call.ended) {
+                toast("Couldn't finish sending", {variant: "error", description: e.message});
+            }
+        }
+    }
+
+    function liveCancel(call) {
+        call = call || live;
+        if (!call || call.ended) {
+            return;
+        }
+        call.cancelled = true;
+        if (call.visible && call.view) {
+            call.view.hint.textContent = "Cancelling…";
+            call.view.send.disabled = call.view.finish.disabled = call.view.cancel.disabled = true;
+        }
+        if (call.id) {
+            liveOp(call, "cancel").catch(() => call.abort.abort());
+        } else {
+            call.abort.abort();
+        }
+    }
+
+    // Cancels the live call, if any, and stops showing it.
+    function stopLiveCall() {
+        const call = live;
+        if (!call) {
+            return;
+        }
+        call.visible = false;
+        live = null;
+        liveCancel(call);
+        updateInvokeButton();
+    }
+
     els.invoke.addEventListener("click", () => invoke());
+    els.fake.addEventListener("click", () => fillWithFakeData());
 
     // ---------------------------------------------------------------------
     // Storage
