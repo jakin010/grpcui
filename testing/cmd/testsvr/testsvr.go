@@ -32,6 +32,8 @@ import (
 
 func main() {
 	port := flag.Int("port", 0, "Port on which to listen")
+	rpID := flag.String("passkey-rp-id", "localhost", "Relying party ID (site) of the passkey demo services")
+	origins := flag.String("passkey-origins", "https://localhost,http://localhost:*", "Comma-separated origins the passkey demo services accept; host:* allows any port")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
@@ -49,9 +51,22 @@ func main() {
 
 	svr := grpc.NewServer()
 	RegisterKitchenSinkServer(svr, &testSvr{})
+
+	pkFile, err := passkeyFile()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to parse %s: %v\n", passkeysProtoName, err)
+		os.Exit(1)
+	}
+	registerPasskeyServices(svr, pkFile, newPasskeyDemo(*rpID, strings.Split(*origins, ",")))
+	resolver, err := newCombinedResolver(sourceinfo.GlobalFiles, pkFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to register %s: %v\n", passkeysProtoName, err)
+		os.Exit(1)
+	}
+
 	refSvc := reflection.NewServerV1(reflection.ServerOptions{
 		Services:           svr,
-		DescriptorResolver: sourceinfo.GlobalFiles,
+		DescriptorResolver: resolver,
 		ExtensionResolver:  sourceinfo.GlobalFiles,
 	})
 	reflectionpb.RegisterServerReflectionServer(svr, refSvc)
