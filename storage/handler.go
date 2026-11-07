@@ -27,6 +27,16 @@ func (s *Store) Handler() http.Handler {
 	mux.HandleFunc("POST /saved/import", s.handleImportSaved)
 	mux.HandleFunc("PUT /saved/{id}", s.handleUpdateSaved)
 	mux.HandleFunc("DELETE /saved/{id}", s.handleDeleteSaved)
+	mux.HandleFunc("GET /passkeys", s.handleListPasskeys)
+	mux.HandleFunc("POST /passkeys", s.handleRecordPasskey)
+	mux.HandleFunc("POST /passkeys/create", s.handleCreatePasskey)
+	mux.HandleFunc("POST /passkeys/sign", s.handleSignWithPasskey)
+	mux.HandleFunc("POST /passkeys/{id}/confirm", s.handleConfirmPasskey)
+	mux.HandleFunc("DELETE /passkeys/{id}", s.handleDeletePasskey)
+	mux.HandleFunc("GET /flows", s.handleListFlows)
+	mux.HandleFunc("POST /flows", s.handleAddFlow)
+	mux.HandleFunc("PUT /flows/{id}", s.handleUpdateFlow)
+	mux.HandleFunc("DELETE /flows/{id}", s.handleDeleteFlow)
 	return mux
 }
 

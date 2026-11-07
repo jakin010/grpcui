@@ -60,9 +60,36 @@ var migrations = []migration{
 		CREATE INDEX history_target_time ON history (target, start_time, id);`,
 		fn: normalizeHistoryStartTimes,
 	},
+	// 3: passkeys made or recorded by passkey flows, and the flows
+	{sql: `CREATE TABLE passkeys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		kind TEXT NOT NULL,
+		status TEXT NOT NULL,
+		rp_id TEXT NOT NULL,
+		origin TEXT NOT NULL DEFAULT '',
+		credential_id TEXT NOT NULL,
+		user_id TEXT NOT NULL DEFAULT '',
+		user_name TEXT NOT NULL DEFAULT '',
+		display_name TEXT NOT NULL DEFAULT '',
+		public_key TEXT NOT NULL DEFAULT '',
+		private_key BLOB,
+		sign_count INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL,
+		last_used_at TEXT
+	);
+	CREATE UNIQUE INDEX passkeys_credential ON passkeys (rp_id, credential_id);
+	CREATE TABLE passkey_flows (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		flow TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);`},
 }
 
-// Store is a SQLite database of request history and saved requests. It is
+// Store is a SQLite database of request history, saved requests, passkeys
+// and passkey flows. It is
 // safe for concurrent use, and several Stores (in one or more processes) may
 // use the same database file.
 type Store struct {
