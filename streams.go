@@ -32,7 +32,8 @@ import (
 // out), the invoke handler supports live calls, where request messages can be
 // sent while the call runs and responses are streamed back as they arrive.
 // They are driven with the "op" query parameter, all as POSTs to the method's
-// path:
+// path (send, close and cancel work even if the schema has been reloaded since
+// the call started):
 //
 //	?op=open             body like a one-shot invocation; the response is a
 //	                     stream of newline-delimited JSON events (see
@@ -76,8 +77,10 @@ type liveCall struct {
 	id     string
 	method string
 	md     *desc.MethodDescriptor
-	ctx    context.Context // ends when the call is cancelled or times out
-	cancel context.CancelFunc
+	// descSource resolves the method's messages, as of when the call started
+	descSource grpcurl.DescriptorSource
+	ctx        context.Context // ends when the call is cancelled or times out
+	cancel     context.CancelFunc
 
 	mu         sync.Mutex
 	queue      []json.RawMessage
@@ -203,13 +206,8 @@ func validateMessages(md *desc.MethodDescriptor, descSource grpcurl.DescriptorSo
 	return nil
 }
 
-func (lc *liveCalls) serve(w http.ResponseWriter, r *http.Request, op string, md *desc.MethodDescriptor, ch grpc.ClientConnInterface, descSource grpcurl.DescriptorSource, options *InvokeOptions) {
-	method := md.GetFullyQualifiedName()
-	if op == "open" {
-		lc.open(w, r, md, ch, descSource, options)
-		return
-	}
-
+// serveOp handles send, close and cancel for a running call.
+func (lc *liveCalls) serveOp(w http.ResponseWriter, r *http.Request, op, method string) {
 	call := lc.get(r.URL.Query().Get("id"), method)
 	if call == nil {
 		http.Error(w, "No such call. It may have ended already.", http.StatusGone)
@@ -224,11 +222,11 @@ func (lc *liveCalls) serve(w http.ResponseWriter, r *http.Request, op string, md
 			http.Error(w, "Failed to parse JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		if !md.IsClientStreaming() {
+		if !call.md.IsClientStreaming() {
 			http.Error(w, "This method takes a single request message, so nothing more can be sent.", http.StatusConflict)
 			return
 		}
-		if err := validateMessages(md, descSource, input.Data); err != nil {
+		if err := validateMessages(call.md, call.descSource, input.Data); err != nil {
 			http.Error(w, "Invalid request message: "+err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -276,13 +274,14 @@ func (lc *liveCalls) open(w http.ResponseWriter, r *http.Request, md *desc.Metho
 	}
 
 	call := &liveCall{
-		id:     newCallID(),
-		method: md.GetFullyQualifiedName(),
-		md:     md,
-		ctx:    ctx,
-		cancel: cancel,
-		notify: make(chan struct{}, 1),
-		done:   make(chan struct{}),
+		id:         newCallID(),
+		method:     md.GetFullyQualifiedName(),
+		md:         md,
+		descSource: descSource,
+		ctx:        ctx,
+		cancel:     cancel,
+		notify:     make(chan struct{}, 1),
+		done:       make(chan struct{}),
 	}
 	call.queue = append(call.queue, input.Data...)
 	call.total = len(input.Data)

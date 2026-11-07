@@ -1,12 +1,15 @@
 package standalone
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"net/http"
 	"path"
+
+	"github.com/jhump/protoreflect/desc"
 )
 
 // WebFormContainerTemplateData is the param type for templates that embed the webform HTML.
@@ -243,6 +246,21 @@ func WithGRPCOptions(options []string) HandlerOption {
 	})
 }
 
+// SchemaLoader loads the RPC schema: the methods to show in the web UI, and
+// all known files (see Handler).
+type SchemaLoader func(ctx context.Context) ([]*desc.MethodDescriptor, []*desc.FileDescriptor, error)
+
+// WithSchemaReloader adds a "Reload schema" button to the web UI, which calls
+// load and then shows the methods it returns, without restarting the server
+// or reloading the page. Use it to pick up changes after the gRPC server is
+// redeployed or proto files are edited. The handler serves it as POST
+// "/reload", with the same CSRF check as RPC invocations.
+func WithSchemaReloader(load SchemaLoader) HandlerOption {
+	return optFunc(func(opts *handlerOptions) {
+		opts.reloadSchema = load
+	})
+}
+
 // optFunc implements HandlerOption
 type optFunc func(opts *handlerOptions)
 
@@ -265,6 +283,7 @@ type handlerOptions struct {
 	debug               *bool
 	gRPCurlOptions      []string
 	storage             http.Handler
+	reloadSchema        SchemaLoader
 }
 
 func (opts *handlerOptions) addlServedResources() []*resource {

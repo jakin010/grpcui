@@ -25,6 +25,7 @@ const ICONS = {
     "layers": '<path d="m12 2 10 5-10 5L2 7l10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
     "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
     "play": '<path d="M6 3l14 9-14 9V3z"/>',
+    "refresh": '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
     "square": '<rect x="5" y="5" width="14" height="14" rx="2"/>',
     "arrow-up": '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>',
     "arrow-down": '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
@@ -774,14 +775,22 @@ window.initGRPCForm = function(cfg) {
     const rootEl = qs("#grpcui");
     ROOT = rootEl;
 
-    // services: full service name -> [{name, clientStream, serverStream}]
-    const services = {};
-    for (const svc of cfg.services || []) {
-        services[svc] = (cfg.methods && cfg.methods[svc]) || [];
+    // The schema: services (full service name -> [{name, clientStream,
+    // serverStream}]) and their definitions. Replaced when it's reloaded.
+    let services = {};
+    let serviceNames = [];
+    let svcDescs = {};
+    let mtdDescs = {};
+    function applySchema(sc) {
+        services = {};
+        for (const svc of sc.services || []) {
+            services[svc] = (sc.methods && sc.methods[svc]) || [];
+        }
+        serviceNames = Object.keys(services).sort();
+        svcDescs = sc.svcDescs || {};
+        mtdDescs = sc.mtdDescs || {};
     }
-    const serviceNames = Object.keys(services).sort();
-    const svcDescs = cfg.svcDescs || {};
-    const mtdDescs = cfg.mtdDescs || {};
+    applySchema(cfg);
     const invokeURI = cfg.invokeURI;
     const metadataURI = cfg.metadataURI;
     const debug = !!cfg.debug;
@@ -834,6 +843,7 @@ window.initGRPCForm = function(cfg) {
         timeout: qs("#gu-timeout"),
         invoke: qs("#gu-invoke"),
         fake: qs("#gu-fake-btn"),
+        reload: qs("#gu-reload-btn"),
         invokeLabel: qs("#gu-invoke-label"),
         response: qs("#gu-response"),
         respStatus: qs("#gu-resp-status"),
@@ -971,7 +981,7 @@ window.initGRPCForm = function(cfg) {
         return root;
     }
 
-    const packageTree = buildPackageTree();
+    let packageTree = buildPackageTree();
     const treeState = storage.getJSON(KEYS.tree, {}) || {};
     let treeFilter = "";
 
@@ -7471,17 +7481,144 @@ window.initGRPCForm = function(cfg) {
         return method ? {service: svc, method: method} : null;
     }
 
+
+    // ---------------------------------------------------------------------
+    // Reloading the schema
+    //
+    // Asks the server to load the schema again (after the gRPC server is
+    // redeployed, or proto files change) and shows the result without
+    // reloading the page. The selected method keeps its request when it still
+    // fits, and a live call keeps running.
+    // ---------------------------------------------------------------------
+
+    function showNoMethods() {
+        state.service = null;
+        state.method = null;
+        state.schema = null;
+        state.schemaReady = false;
+        setInvokeEnabled(false);
+        renderBreadcrumb();
+        els.methodCard.replaceChildren();
+        renderMetadataSection();
+        updateFormTools();
+        els.form.replaceChildren(h("div", {class: "gu-empty"}, icon("server", 28),
+            h("p", {class: "gu-empty-title", text: "No methods to show"}),
+            h("p", {class: "gu-empty-desc", text: "The server didn't report any services."})));
+    }
+
+    const methodNames = () => new Set(serviceNames.flatMap(svc => services[svc].map(m => svc + "." + m.name)));
+
+    // Loads the selected method's schema again, keeping the request if it
+    // still fits.
+    function refreshSelectedMethod() {
+        const svc = state.service;
+        const method = state.method;
+        const keep = JSON.parse(JSON.stringify(state.request === undefined ? null : state.request));
+        renderBreadcrumb();
+        renderMethodCard();
+        renderMetadataSection();
+        state.schemaReady = false;
+        setInvokeEnabled(false);
+        const seq = ++state.loadSeq;
+        return api(metadataURI + "?method=" + encodeURIComponent(svc + "." + method)).then(schema => {
+            if (seq !== state.loadSeq) {
+                return true;
+            }
+            buildRequestForm(schema);
+            if (keep === null) {
+                return true;
+            }
+            updateJSONRequest(keep);
+            try {
+                validateJSON();
+                return true;
+            } catch (e) {
+                // the form still has the defaults; show those
+                updateJSONRequest(state.request);
+                return false;
+            }
+        });
+    }
+
+    let reloading = false;
+
+    async function reloadSchema() {
+        if (reloading || !cfg.reloadURI) {
+            return;
+        }
+        reloading = true;
+        els.reload.disabled = true;
+        els.reload.replaceChildren(icon("refresh", 16, "spin"));
+        try {
+            const before = methodNames();
+            const next = await api(cfg.reloadURI, {method: "POST", body: {}});
+            applySchema(next || {});
+            const after = methodNames();
+            const added = [...after].filter(m => !before.has(m)).length;
+            const removed = [...before].filter(m => !after.has(m)).length;
+            schemaCache.clear();
+            packageTree = buildPackageTree();
+            renderTree();
+
+            const parts = [];
+            if (added) {
+                parts.push(plural(added, "method") + " added");
+            }
+            if (removed) {
+                parts.push(plural(removed, "method") + " removed");
+            }
+            let note = "";
+            if (state.service && hasMethod(state.service, state.method)) {
+                const kept = await refreshSelectedMethod().catch(e => {
+                    els.form.replaceChildren(alertBox("destructive", "Couldn't load this method", e.message));
+                    return true;
+                });
+                if (!kept) {
+                    note = "The request didn't fit the new schema, so the form was reset.";
+                }
+            } else if (state.service) {
+                const gone = state.service + "/" + state.method;
+                stopLiveCall();
+                resetResponse();
+                const first = initialSelection();
+                if (first) {
+                    selectMethod(first.service, first.method);
+                } else {
+                    showNoMethods();
+                }
+                note = gone + " is no longer on the server.";
+            } else {
+                const first = initialSelection();
+                if (first) {
+                    selectMethod(first.service, first.method);
+                }
+            }
+            const summary = (parts.length ? parts.join(", ") : "No methods added or removed") + "." + (note ? "\n" + note : "");
+            toast("Schema reloaded", {description: summary});
+        } catch (e) {
+            if (debug) {
+                console.trace(e);
+            }
+            toast("Couldn't reload the schema", {variant: "error", description: e.message});
+        } finally {
+            reloading = false;
+            els.reload.disabled = false;
+            els.reload.replaceChildren(icon("refresh", 16));
+        }
+    }
+
+    if (cfg.reloadURI) {
+        els.reload.hidden = false;
+        els.reload.addEventListener("click", () => reloadSchema());
+    }
+
     renderTree();
     resetResponse();
     const first = initialSelection();
     if (first) {
         selectMethod(first.service, first.method);
     } else {
-        renderMetadataSection();
-        updateFormTools();
-        els.form.replaceChildren(h("div", {class: "gu-empty"}, icon("server", 28),
-            h("p", {class: "gu-empty-title", text: "No methods to show"}),
-            h("p", {class: "gu-empty-desc", text: "The server didn't report any services."})));
+        showNoMethods();
     }
 };
 

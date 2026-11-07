@@ -58,6 +58,11 @@ Fields start switched on with their default values, except fields declared `opti
 `email` gets an email address, a `created_at` a recent time, a `page_size` a small number, and
 fields it can't guess get a random value of their type.
 
+The **Reload schema** button (the circular arrows at the top) loads the schema again without
+restarting `grpcui`: it asks the server again when using reflection, and re-reads `-proto` and
+`-protoset` files from disk. Use it after redeploying the server or editing proto files. The
+selected method keeps its request when it still fits, and a running streaming call keeps going.
+
 Upon issuing an RPC, the web UI shows all gRPC response metadata, including both headers and
 trailers sent by the server. And, of course, it shows a human-comprehensible response body, in
 the form of an HTML table.
