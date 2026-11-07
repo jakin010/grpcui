@@ -35,6 +35,9 @@ import (
 // format of the request and response bodies matches the formats sent and
 // expected by the JavaScript client code embedded in WebFormContents.
 //
+// Streaming methods can also be run as live calls, where messages are sent
+// and received while the call runs; see streams.go for that protocol.
+//
 // The returned handler expects to serve "/". If it will instead be handling a
 // sub-path (e.g. handling "/rpc/invoke/") then use http.StripPrefix.
 //
@@ -72,6 +75,7 @@ type InvokeOptions struct {
 // accepts an additional argument, options. This can be used to add extra
 // request metadata to all RPCs invoked.
 func RPCInvokeHandlerWithOptions(ch grpc.ClientConnInterface, descs []*desc.MethodDescriptor, options InvokeOptions) http.Handler {
+	live := newLiveCalls()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			w.Header().Set("Allow", "POST")
@@ -83,6 +87,7 @@ func RPCInvokeHandlerWithOptions(ch grpc.ClientConnInterface, descs []*desc.Meth
 			http.Error(w, "Request must be JSON", http.StatusUnsupportedMediaType)
 			return
 		}
+		op := r.URL.Query().Get("op")
 
 		method := r.URL.Path
 		if method[0] == '/' {
@@ -94,6 +99,11 @@ func RPCInvokeHandlerWithOptions(ch grpc.ClientConnInterface, descs []*desc.Meth
 				descSource, err := grpcurl.DescriptorSourceFromFileDescriptors(md.GetFile())
 				if err != nil {
 					http.Error(w, "Failed to create descriptor source: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+				if op != "" {
+					// a live call (see streams.go)
+					live.serve(w, r, op, md, ch, descSource, &options)
 					return
 				}
 				results, err := invokeRPC(r.Context(), method, ch, descSource, r.Header, r.Body, &options)
@@ -176,23 +186,28 @@ func RPCMetadataHandler(methods []*desc.MethodDescriptor, files []*desc.FileDesc
 // What if we wanted to load metadata for all methods? We should consider splitting this
 // into 2 separate types for metadata to respond with accordingly.
 type schema struct {
-	RequestType   string                  `json:"requestType"`
-	RequestStream bool                    `json:"requestStream"`
-	ResponseType  string                  `json:"responseType,omitempty"`
-	MessageTypes  map[string][]fieldDef   `json:"messageTypes"`
-	EnumTypes     map[string][]enumValDef `json:"enumTypes"`
+	RequestType    string                  `json:"requestType"`
+	RequestStream  bool                    `json:"requestStream"`
+	ResponseStream bool                    `json:"responseStream"`
+	ResponseType   string                  `json:"responseType,omitempty"`
+	MessageTypes   map[string][]fieldDef   `json:"messageTypes"`
+	EnumTypes      map[string][]enumValDef `json:"enumTypes"`
 }
 
 type fieldDef struct {
-	Name        string      `json:"name"`
-	ProtoName   string      `json:"protoName"`
-	Type        fieldType   `json:"type"`
-	OneOfFields []fieldDef  `json:"oneOfFields"`
-	IsMessage   bool        `json:"isMessage"`
-	IsEnum      bool        `json:"isEnum"`
-	IsArray     bool        `json:"isArray"`
-	IsMap       bool        `json:"isMap"`
-	IsRequired  bool        `json:"isRequired"`
+	Name        string     `json:"name"`
+	ProtoName   string     `json:"protoName"`
+	Type        fieldType  `json:"type"`
+	OneOfFields []fieldDef `json:"oneOfFields"`
+	IsMessage   bool       `json:"isMessage"`
+	IsEnum      bool       `json:"isEnum"`
+	IsArray     bool       `json:"isArray"`
+	IsMap       bool       `json:"isMap"`
+	IsRequired  bool       `json:"isRequired"`
+	// IsOptional is true for fields declared optional: proto3 "optional"
+	// fields, and proto2 fields that are neither required nor repeated. The
+	// web form starts other fields switched on.
+	IsOptional  bool        `json:"isOptional"`
 	DefaultVal  interface{} `json:"defaultVal"`
 	Description string      `json:"description"`
 }
@@ -262,11 +277,12 @@ func gatherAllMessages(msgs []*desc.MessageDescriptor, result *schema) {
 func gatherMetadataForMethod(md *desc.MethodDescriptor) (*schema, error) {
 	msg := md.GetInputType()
 	result := &schema{
-		RequestType:   msg.GetFullyQualifiedName(),
-		RequestStream: md.IsClientStreaming(),
-		ResponseType:  md.GetOutputType().GetFullyQualifiedName(),
-		MessageTypes:  map[string][]fieldDef{},
-		EnumTypes:     map[string][]enumValDef{},
+		RequestType:    msg.GetFullyQualifiedName(),
+		RequestStream:  md.IsClientStreaming(),
+		ResponseStream: md.IsServerStreaming(),
+		ResponseType:   md.GetOutputType().GetFullyQualifiedName(),
+		MessageTypes:   map[string][]fieldDef{},
+		EnumTypes:      map[string][]enumValDef{},
 	}
 
 	result.visitMessage(msg)
@@ -313,6 +329,7 @@ func (s *schema) processField(fd *desc.FieldDescriptor) fieldDef {
 		IsArray:    fd.IsRepeated() && !fd.IsMap(),
 		IsMap:      fd.IsMap(),
 		IsRequired: fd.IsRequired(),
+		IsOptional: fd.IsProto3Optional() || (!fd.GetFile().IsProto3() && !fd.IsRequired() && !fd.IsRepeated()),
 		DefaultVal: fd.GetDefaultValue(),
 	}
 
@@ -383,6 +400,8 @@ func (s *schema) processOneOf(ood *desc.OneOfDescriptor) fieldDef {
 		Name:        ood.GetName(),
 		Type:        typeOneOf,
 		OneOfFields: choices,
+		// a proto3 optional field is held in a oneof of its own
+		IsOptional: ood.IsSynthetic(),
 	}
 }
 
